@@ -57,6 +57,8 @@ _NY_DEFAULT = 8192
 
 
 class Architecture(_Enum):
+    COMPLEX = "complex"
+    REVxSTD = "revxstd"
     STANDARD = "standard"
     LITE = "lite"
     FEATHER = "feather"
@@ -844,6 +846,82 @@ def _check_data(
 
 def get_wavenet_config(architecture):
     return {
+        Architecture.COMPLEX: {
+            "layers_configs": [
+                {
+                    "input_size": 1,
+                    "condition_size": 1,
+                    "channels": 32,
+                    "head_size": 8,
+                    "kernel_size": 3,
+                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": False,
+                },
+                {
+                    "condition_size": 1,
+                    "input_size": 32,
+                    "channels": 8,
+                    "head_size": 1,
+                    "kernel_size": 3,
+                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": True,
+                },
+            ],
+            "head_scale": 0.02,
+        },
+        Architecture.REVxSTD: {
+            "layers_configs": [
+                {
+                    "input_size": 1,
+                    "condition_size": 1,
+                    "channels": 8,
+                    "head_size": 8,
+                    "kernel_size": 6,
+                    "dilations": [729, 243, 81, 27, 9, 3, 1],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": False
+                },
+                {
+                    "condition_size": 1,
+                    "input_size": 8,
+                    "channels": 8,
+                    "head_size": 8,
+                    "kernel_size": 6,
+                    "dilations": [729, 243, 81, 27, 9, 3, 1],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": False
+                },
+                {
+                    "condition_size": 1,
+                    "input_size": 8,
+                    "channels": 8,
+                    "head_size": 8,
+                    "kernel_size": 6,
+                    "dilations": [729, 243, 81, 27, 9, 3, 1],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": False
+                },
+                {
+                    "condition_size": 1,
+                    "input_size": 8,
+                    "channels": 8,
+                    "head_size": 1,
+                    "kernel_size": 6,
+                    "dilations": [729, 243, 81, 27, 9, 3, 1],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": True
+                }
+            ],
+            "head_scale": 0.99
+        },
         Architecture.STANDARD: {
             "layers_configs": [
                 {
@@ -1088,7 +1166,7 @@ def _get_configs(
             "shuffle": True,
             "pin_memory": True,
             "drop_last": True,
-            "num_workers": 0,
+            "num_workers": 8,
         },
         "val_dataloader": {},
         "trainer": {"max_epochs": epochs, **device_config},
@@ -1373,16 +1451,16 @@ def train(
     input_path: str,
     output_path: str,
     train_path: str,
-    epochs=100,
+    epochs=1000,
     latency: _Optional[int] = None,
     model_type: str = "WaveNet",
     architecture: _Union[Architecture, str] = Architecture.STANDARD,
     batch_size: int = 16,
     ny: int = _NY_DEFAULT,
-    lr=0.004,
-    lr_decay=0.007,
+    lr=0.002,
+    lr_decay=0.004,
     seed: _Optional[int] = 0,
-    save_plot: bool = False,
+    save_plot: bool = True,
     silent: bool = False,
     modelname: str = "model",
     ignore_checks: bool = False,

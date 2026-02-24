@@ -1228,6 +1228,7 @@ def _get_configs(
             "pin_memory": True,
             "drop_last": True,
             "num_workers": 8,
+            "persistent_workers": True
         },
         "val_dataloader": {},
         "trainer": {"max_epochs": epochs, **device_config},

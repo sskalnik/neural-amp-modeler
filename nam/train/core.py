@@ -58,6 +58,7 @@ _NY_DEFAULT = 8192
 
 class Architecture(_Enum):
     COMPLEX = "complex"
+    REVyHI = "revyhi"
     REVxSTD = "revxstd"
     STANDARD = "standard"
     LITE = "lite"
@@ -872,6 +873,66 @@ def get_wavenet_config(architecture):
                 },
             ],
             "head_scale": 0.02,
+        },
+        Architecture.REVyHI: {
+            "layers_configs": [
+                {
+                    "input_size": 1,
+                    "condition_size": 1,
+                    "channels": 10,
+                    "head_size": 10,
+                    "kernel_size": 6,
+                    "dilations": [1024, 256, 64, 16, 4, 1],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": False,
+                },
+                {
+                    "input_size": 10,
+                    "condition_size": 1,
+                    "channels": 10,
+                    "head_size": 10,
+                    "kernel_size": 6,
+                    "dilations": [1024, 256, 64, 16, 4, 1],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": False,
+                },
+                {
+                    "input_size": 10,
+                    "condition_size": 1,
+                    "channels": 10,
+                    "head_size": 10,
+                    "kernel_size": 6,
+                    "dilations": [1024, 256, 64, 16, 4, 1],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": False,
+                },
+                {
+                    "input_size": 10,
+                    "condition_size": 1,
+                    "channels": 10,
+                    "head_size": 10,
+                    "kernel_size": 6,
+                    "dilations": [1024, 256, 64, 16, 4, 1],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": False,
+                },
+                {
+                    "input_size": 10,
+                    "condition_size": 1,
+                    "channels": 10,
+                    "head_size": 1,
+                    "kernel_size": 6,
+                    "dilations": [1024, 256, 64, 16, 4, 1],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": True,
+                }
+            ],
+            "head_scale": 0.99
         },
         Architecture.REVxSTD: {
             "layers_configs": [

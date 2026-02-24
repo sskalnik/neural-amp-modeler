@@ -545,7 +545,7 @@ class GUI(object):
         self._frame_advanced_options.pack(side=_tk.BOTTOM, anchor="e")
 
         # Advanced options for training
-        default_architecture = _core.Architecture.STANDARD
+        default_architecture = _core.Architecture.COMPLEX
         self.advanced_options = AdvancedOptions(
             default_architecture,
             _DEFAULT_NUM_EPOCHS,

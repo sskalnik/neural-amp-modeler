@@ -58,8 +58,8 @@ _NY_DEFAULT = 8192
 
 class Architecture(_Enum):
     COMPLEX = "complex"
-    REVyHI = "revyhi"
-    REVxSTD = "revxstd"
+    REVYHI = "revyhi"
+    REVXSTD = "revxstd"
     STANDARD = "standard"
     LITE = "lite"
     FEATHER = "feather"

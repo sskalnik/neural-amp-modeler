@@ -874,7 +874,7 @@ def get_wavenet_config(architecture):
             ],
             "head_scale": 0.02,
         },
-        Architecture.REVyHI: {
+        Architecture.REVYHI: {
             "layers_configs": [
                 {
                     "input_size": 1,
@@ -934,7 +934,7 @@ def get_wavenet_config(architecture):
             ],
             "head_scale": 0.99
         },
-        Architecture.REVxSTD: {
+        Architecture.REVXSTD: {
             "layers_configs": [
                 {
                     "input_size": 1,

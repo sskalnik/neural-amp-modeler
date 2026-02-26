@@ -26,6 +26,7 @@ import logging as _logging
 import pytorch_lightning as _pl
 import torch as _torch
 import torch.nn as _nn
+import bitsandbytes as bnb
 
 from .._core import InitializableFromConfig as _InitializableFromConfig
 from .._dependencies import auraloss as _auraloss
@@ -278,7 +279,8 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         return self._net
 
     def configure_optimizers(self):
-        optimizer = _torch.optim.Adam(self.parameters(), **self._optimizer_config)
+        #optimizer = _torch.optim.Adam(self.parameters(), **self._optimizer_config)
+        optimizer = bnb.optim.AdamW8bit(self.parameters(), **self._optimizer_config)
         if self._scheduler_config is None:
             return optimizer
         else:

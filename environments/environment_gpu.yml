@@ -9,7 +9,7 @@ channels:
   - nvidia  # GPU
   - defaults
 dependencies:
-  - python>=3.9
+  - python>=3.13
   - black
   - flake8
   - h5py
@@ -25,7 +25,7 @@ dependencies:
   # If your GPU isn't being detected, you may need a different version.
   # You're going to need to look at Table 3 here: 
   # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html#cuda-major-component-versions__table-cuda-toolkit-driver-versions
-  - pytorch::pytorch-cuda=12.1  # GPU
+  - pytorch::pytorch-cuda=13.0  # GPU 2.10.0+cu130
   - semver
   - tensorboard
   - tqdm

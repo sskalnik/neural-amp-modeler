@@ -49,6 +49,8 @@ from ..util import filter_warnings as _filter_warnings
 from ._version import PROTEUS_VERSION as _PROTEUS_VERSION, Version as _Version
 from .lightning_module import LightningModule as _LightningModule
 from . import metadata as _metadata
+from pytorch_lightning.loggers import TensorBoardLogger
+
 
 # Training using the simplified trainers in NAM is done at 48k.
 STANDARD_SAMPLE_RATE = 48_000.0
@@ -57,6 +59,7 @@ _NY_DEFAULT = 8192
 
 
 class Architecture(_Enum):
+    ULTRA = "ultra"
     COMPLEX = "complex"
     REVYHI = "revyhi"
     REVXSTD = "revxstd"
@@ -847,6 +850,59 @@ def _check_data(
 
 def get_wavenet_config(architecture):
     return {
+        # head_size -> channels
+        # channels  -> input_size
+		#
+		# head 3 -> channels 3 -> input 3
+		Architecture.ULTRA: {
+            "layers_configs": [
+                {
+                    "input_size": 1,
+                    "condition_size": 1,
+                    "channels": 32,
+                    "head_size": 8,
+                    "kernel_size": 3,
+                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": False,
+                },
+                {
+                    "input_size": 32,
+                    "condition_size": 1,
+                    "channels": 8,
+                    "head_size": 8,
+                    "kernel_size": 3,
+                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": False,
+                },
+				{
+                    "input_size": 8,
+                    "condition_size": 1,
+                    "channels": 8,
+                    "head_size": 8,
+                    "kernel_size": 3,
+                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": False,
+                },
+				{
+                    "input_size": 8,
+                    "condition_size": 1,
+                    "channels": 8,
+                    "head_size": 1,
+                    "kernel_size": 3,
+                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+                    "activation": "Tanh",
+                    "gated": False,
+                    "head_bias": True,
+                },
+            ],
+            "head_scale": 0.02,
+        },
         Architecture.COMPLEX: {
             "layers_configs": [
                 {
@@ -1281,7 +1337,9 @@ def _plot(
 
     esr = _esr(_torch.Tensor(output), ds.y)
     # Trying my best to put numbers to it...
-    if esr < 0.01:
+    if esr < 0.001:
+        esr_comment = "HOLY SHIT BRO!!! Niiiiiiice! 🤘😎"
+    elif esr < 0.01:
         esr_comment = "Great!"
     elif esr < 0.035:
         esr_comment = "Not bad!"
@@ -1300,7 +1358,7 @@ def _plot(
     _plt.title(f"ESR={esr:.4g}")
     _plt.legend()
     if filepath is not None:
-        _plt.savefig(filepath + ".png")
+        _plt.savefig(f"{filepath}_{int(_time())}.png")
     if not silent:
         _plt.show()
     return esr
@@ -1400,7 +1458,7 @@ class _ModelCheckpoint(_pl.callbacks.model_checkpoint.ModelCheckpoint):
         nam_model = pl_model.net
         outdir = nam_filepath.parent
         # HACK: Assume the extension
-        basename = nam_filepath.name[: -len(self._NAM_FILE_EXTENSION)]
+        basename = f"{nam_filepath.name[: -len(self._NAM_FILE_EXTENSION)]}_{int(_time())}"
         other_metadata = (
             None
             if not self._include_other_metadata
@@ -1642,6 +1700,14 @@ def train(
     settings_metadata = _metadata.Settings(ignore_checks=ignore_checks)
     data_metadata = _metadata.Data(latency=latency_analysis, checks=data_check_output)
 
+    # /save_dir/name/version/sub_dir/
+    # if sub_dir is None:
+    #     /save_dir/name/version/
+    str_batch_size = str(batch_size)
+    str_epochs = str(epochs)
+    str_architecture = architecture.value
+    logger = TensorBoardLogger(save_dir=modelname, name=str_architecture, version=str_epochs, sub_dir=str_batch_size)
+
     trainer = _pl.Trainer(
         callbacks=get_callbacks(
             threshold_esr,
@@ -1651,6 +1717,7 @@ def train(
         ),
         default_root_dir=train_path,
         fast_dev_run=fast_dev_run,
+        logger=logger,
         **learning_config["trainer"],
     )
 

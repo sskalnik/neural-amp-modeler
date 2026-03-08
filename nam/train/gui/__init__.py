@@ -79,6 +79,13 @@ if _HAVE_ACCELERATOR:
     _DEFAULT_BATCH_SIZE = 32   # 16     # 16
     _DEFAULT_LR = 0.002        # 0.0048 # 0.004
     _DEFAULT_LR_DECAY = 0.004  # 0.0016 # 0.007
+    # Andrei (creator of REVxSTD and REVyHI) suggests these values:
+    # For standard input.wav file:
+    #     learning rate=0.0064
+    #     learning rate decay=0.0023
+    # For 50k input file:
+    #     learning rate=0.0032
+    #     learning rate decay=0.0023
 else:
     _DEFAULT_NUM_EPOCHS = 100
     _DEFAULT_BATCH_SIZE = 32

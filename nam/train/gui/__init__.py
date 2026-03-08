@@ -75,13 +75,16 @@ except ImportError:
     _HAVE_ACCELERATOR = False
 
 if _HAVE_ACCELERATOR:
-    _DEFAULT_NUM_EPOCHS = 1000
-    _DEFAULT_BATCH_SIZE = 32
-    _DEFAULT_LR_DECAY = 0.004
+    _DEFAULT_NUM_EPOCHS = 1000 # SlaMo  # NAM 0.12.2
+    _DEFAULT_BATCH_SIZE = 32   # 16     # 16
+    _DEFAULT_LR = 0.002        # 0.0048 # 0.004
+    _DEFAULT_LR_DECAY = 0.004  # 0.0016 # 0.007
 else:
     _DEFAULT_NUM_EPOCHS = 100
     _DEFAULT_BATCH_SIZE = 32
+    _DEFAULT_LR = 0.002
     _DEFAULT_LR_DECAY = 0.004
+
 _BUTTON_WIDTH = 20
 _BUTTON_HEIGHT = 2
 _TEXT_WIDTH = 100
@@ -90,8 +93,8 @@ _DEFAULT_DELAY = None
 _DEFAULT_IGNORE_CHECKS = False
 _DEFAULT_THRESHOLD_ESR = None
 
-_ADVANCED_OPTIONS_LEFT_WIDTH = 12
-_ADVANCED_OPTIONS_RIGHT_WIDTH = 12
+_ADVANCED_OPTIONS_LEFT_WIDTH = 16
+_ADVANCED_OPTIONS_RIGHT_WIDTH = 16
 _METADATA_LEFT_WIDTH = 19
 _METADATA_RIGHT_WIDTH = 60
 
@@ -146,6 +149,9 @@ class AdvancedOptions(object):
 
     architecture: _core.Architecture
     num_epochs: int
+    lr: float
+    lr_decay: float
+    batch_size: int
     latency: _Optional[int]
     ignore_checks: bool
     threshold_esr: _Optional[float]
@@ -549,6 +555,9 @@ class GUI(object):
         self.advanced_options = AdvancedOptions(
             default_architecture,
             _DEFAULT_NUM_EPOCHS,
+            _DEFAULT_LR,
+            _DEFAULT_LR_DECAY,
+            _DEFAULT_BATCH_SIZE,
             _DEFAULT_DELAY,
             _DEFAULT_IGNORE_CHECKS,
             _DEFAULT_THRESHOLD_ESR,
@@ -584,9 +593,6 @@ class GUI(object):
         Get any additional kwargs to provide to `core.train`
         """
         return {
-            "lr": 0.002,
-            "lr_decay": _DEFAULT_LR_DECAY,
-            "batch_size": _DEFAULT_BATCH_SIZE,
             "seed": 0,
         }
 
@@ -724,7 +730,10 @@ class GUI(object):
         for widget in self._widgets.values():
             widget["state"] = state
 
+    # TODO: Rename this function to "validate_input_audio_files" or something similar.
     def _train(self):
+        # TODO: Replace every single instance of the use of "input" and "output", as well as "x" and "y", with "dry_audio" and "wet_audio", or something similar.
+        # Original author used "output" to mean "the output of the external effect/amp/whatever", *not* the output of the model training process!
         input_path = self._widgets[_GUIWidgets.INPUT_PATH].val
         output_paths = self._widgets[_GUIWidgets.OUTPUT_PATH].val
         # Validate all files before running:
@@ -737,6 +746,9 @@ class GUI(object):
 
         # Advanced options:
         num_epochs = self.advanced_options.num_epochs
+        lr = self.advanced_options.lr
+        lr_decay = self.advanced_options.lr_decay
+        batch_size = self.advanced_options.batch_size
         architecture = self.advanced_options.architecture
         user_latency = self.advanced_options.latency
         file_list = self._widgets[_GUIWidgets.OUTPUT_PATH].val
@@ -745,6 +757,7 @@ class GUI(object):
         # Run it
         for file in file_list:
             print(f"Now training {file}")
+            # 'C:/foo/bar/my_wet_audio_file.wav' => 'my_wet_audio_file'
             basename = _re.sub(r"\.wav$", "", file.split("/")[-1])
             user_metadata = (
                 self.user_metadata if self.user_metadata_flag else _UserMetadata()
@@ -755,6 +768,9 @@ class GUI(object):
                 file,
                 self._widgets[_GUIWidgets.TRAINING_DESTINATION].val,
                 epochs=num_epochs,
+                lr=lr,
+                lr_decay=lr_decay,
+                batch_size=batch_size,
                 latency=user_latency,
                 architecture=architecture,
                 silent=self._checkboxes[_CheckboxKeys.SILENT_TRAINING].variable.get(),
@@ -787,7 +803,8 @@ class GUI(object):
 
         # Metadata was only valid for 1 run (possibly a batch), so make sure it's not
         # used again unless the user re-visits the window and clicks "ok".
-        self.user_metadata_flag = False
+        #self.user_metadata_flag = False
+        # It's annoying to have to remember to do this every time I change a setting, because the user metadata gets *silently ignored*, so I've commented this out.
 
     def _validate_all_data(
         self, input_path: _Path, output_paths: _Sequence[_Path]
@@ -931,6 +948,13 @@ def _non_negative_int(val):
     val = int(val)
     if val < 0:
         val = 0
+    return val
+
+
+def _non_negative_float(val):
+    val = float(val)
+    if val < 0.0:
+        val = 0.0
     return val
 
 
@@ -1154,7 +1178,7 @@ class AdvancedOptionsGUI(object):
                 pass
 
         # TODO could clean up more / see `.pack_options()`
-        for name in ("architecture", "num_epochs", "latency", "threshold_esr"):
+        for name in ("architecture", "num_epochs", "lr", "lr_decay", "batch_size", "latency", "threshold_esr"):
             safe_apply(name)
 
     def pack(self):
@@ -1174,7 +1198,6 @@ class AdvancedOptionsGUI(object):
         # Number of epochs: text box
         self._frame_epochs = _tk.Frame(self._root)
         self._frame_epochs.pack()
-
         self._num_epochs = LabeledText(
             self._frame_epochs,
             "Epochs",
@@ -1182,10 +1205,39 @@ class AdvancedOptionsGUI(object):
             type=_non_negative_int,
         )
 
-        # Delay: text box
+        # Learning Rate: text box
+        self._frame_lr = _tk.Frame(self._root)
+        self._frame_lr.pack()
+        self._lr = LabeledText(
+            self._frame_lr,
+            "Learning Rate",
+            default=str(self._parent.advanced_options.lr),
+            type=_non_negative_float
+        )
+
+        # Learning Rate Decay: text box
+        self._frame_lr_decay = _tk.Frame(self._root)
+        self._frame_lr_decay.pack()
+        self._lr_decay = LabeledText(
+            self._frame_lr_decay,
+            "Learning Rate Decay",
+            default=str(self._parent.advanced_options.lr_decay),
+            type=_non_negative_float
+        )
+
+        # Batch Size: text box
+        self._frame_batch_size = _tk.Frame(self._root)
+        self._frame_batch_size.pack()
+        self._batch_size = LabeledText(
+            self._frame_batch_size,
+            "Batch Size",
+            default=str(self._parent.advanced_options.batch_size),
+            type=_non_negative_int
+        )
+
+         # Delay: text box
         self._frame_latency = _tk.Frame(self._root)
         self._frame_latency.pack()
-
         self._latency = LabeledText(
             self._frame_latency,
             "Reamp latency",

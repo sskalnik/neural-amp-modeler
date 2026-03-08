@@ -850,11 +850,11 @@ def _check_data(
 
 def get_wavenet_config(architecture):
     return {
-        # head_size -> channels
-        # channels  -> input_size
-		#
-		# head 3 -> channels 3 -> input 3
-		Architecture.ULTRA: {
+    # head_size -> channels
+    # channels  -> input_size
+    #
+    # head 3 -> channels 3 -> input 3
+        Architecture.ULTRA: {
             "layers_configs": [
                 {
                     "input_size": 1,
@@ -878,7 +878,7 @@ def get_wavenet_config(architecture):
                     "gated": False,
                     "head_bias": False,
                 },
-				{
+                {
                     "input_size": 8,
                     "condition_size": 1,
                     "channels": 8,
@@ -889,7 +889,7 @@ def get_wavenet_config(architecture):
                     "gated": False,
                     "head_bias": False,
                 },
-				{
+                {
                     "input_size": 8,
                     "condition_size": 1,
                     "channels": 8,

@@ -1140,6 +1140,10 @@ def get_wavenet_config(architecture):
             ],
             "head_scale": 0.99
         },
+        # Recommended settings: http://coginthemachine.ddns.net/mnt/_namhtml/wnet/namconfig.html
+        # "pre_emph_mrstft_weight": 0.0002 # Same as the default of _CAB_MRSTFT_PRE_EMPH_WEIGHT = 2.0e-4
+        # "pre_emph_mrstft_coef": 0.85     # Same as the default of _CAB_MRSTFT_PRE_EMPH_COEF = 0.85
+        # "lr_scheduler": {{"gamma": 0.9985}
         Architecture.REVYSTD: {
             "layers_configs": [
                 {
@@ -1200,6 +1204,15 @@ def get_wavenet_config(architecture):
             ],
             "head_scale": 0.99
         },
+        # Original uses different settings:
+        # https://github.com/sdatkinson/neural-amp-modeler/compare/main...38github:neural-amp-modeler:main#diff-2ca4268576a15c724ac7227c5ae5e17ed1e70edd2a86ce943497e82973f91030R921
+        # "head_scale": 0.50,
+        # _CAB_MRSTFT_PRE_EMPH_WEIGHT = 1.5e-3 # Different from the default of _CAB_MRSTFT_PRE_EMPH_WEIGHT = 2.0e-4
+        # _CAB_MRSTFT_PRE_EMPH_COEF = 0.15     # Different from the default of _CAB_MRSTFT_PRE_EMPH_COEF = 0.85
+        # "loss": {
+        #     "type": "combined_loss",
+        #     "loss_weights": {"spectral_mse": 0.9, "perceptual_loss": 0.1, "low_freq_weight": 2.0, "high_freq_weight": 1.0},
+        # },
         Architecture.REVXSTD: {
             "layers_configs": [
                 {
@@ -1454,6 +1467,7 @@ def _get_configs(
     batch_size: int,
     fit_mrstft: bool,
 ):
+    # DATA CONFIG
     data_config = _get_data_config(
         input_version=input_version,
         input_path=input_path,
@@ -1462,6 +1476,7 @@ def _get_configs(
         latency=latency,
     )
 
+    # MODEL CONFIG
     if model_type == "WaveNet":
         model_config = {
             "net": {
@@ -1496,6 +1511,7 @@ def _get_configs(
         model_config["loss"]["pre_emph_mrstft_weight"] = _CAB_MRSTFT_PRE_EMPH_WEIGHT
         model_config["loss"]["pre_emph_mrstft_coef"] = _CAB_MRSTFT_PRE_EMPH_COEF
 
+    # DEVICE CONFIG (part of learning_config)
     if _torch.cuda.is_available():
         device_config = {"accelerator": "gpu", "devices": 1}
     elif _torch.backends.mps.is_available():
@@ -1503,6 +1519,7 @@ def _get_configs(
     else:
         print("WARNING: No GPU was found. Training will be very slow!")
         device_config = {}
+    # LEARNING CONFIG
     learning_config = {
         "train_dataloader": {
             "batch_size": batch_size,
@@ -1819,7 +1836,7 @@ def train(
     """
     :param input_path: Full path to input file
     :param output_path: Full path to output file
-    :param lr_decay: =1-gamma for Exponential learning rate decay.
+    :param lr_decay: = 1-gamma for Exponential learning rate decay.
     :param threshold_esr: Stop training if ESR is better than this. Ignore if `None`.
     :param fast_dev_run: One-step training, used for tests.
     """

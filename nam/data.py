@@ -26,8 +26,8 @@ from typing import (
 import librosa as _librosa
 import numpy as _np
 import torch as _torch
-import wavio as _wavio
 from torch.utils.data import Dataset as _Dataset
+from soundfile import SoundFile
 from tqdm import tqdm as _tqdm
 
 from ._core import (
@@ -46,30 +46,18 @@ class Split(_Enum):
     VALIDATION = "validation"
 
 
-@_dataclass
-class WavInfo:
-    """
-    :param sampwidth: Sample width, in bytes. May be `None` if not known.
-    """
-
-    sampwidth: _Optional[int]
-    rate: int
-
-
 class DataError(Exception):
-    """
-    Parent class for all special exceptions raised by NAM data sets
-    """
-
+    """Parent class for all special Exceptions raised by NAM datasets"""
     pass
 
 
 class AudioShapeMismatchError(ValueError, DataError):
     """
-    Exception where the shape (number of samples, number of channels) of two audio files
+    Exception when the shapes (number of samples, number of channels) of two audio files
     don't match but were supposed to.
+    Note that in the audio context we use the term "samples", but in `soundfile` (which returns
+    the audio file's contents as a NumPy array) the term "frames" may be used to mean the same thing.
     """
-
     def __init__(self, shape_expected, shape_actual, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._shape_expected = shape_expected
@@ -84,57 +72,85 @@ class AudioShapeMismatchError(ValueError, DataError):
         return self._shape_actual
 
 
+# This was needed in the original NAM code due to the use of `wavio`.
+#
+# Since `SoundFile.read()` returns a NumPy array - and also because the `soundfile` library allows the
+# use of 32-bit floating-point inputs (`wavio` is limited to integer formats) - some of the logic in
+# the original NAM code is no longer needed.
+# TODO: Refactor the entire codebase, including what's right below this comment.
 def wav_to_np(
     filename: _Union[str, _Path],
-    rate: _Optional[int] = None,
     require_match: _Optional[_Union[str, _Path]] = None,
     required_shape: _Optional[_Tuple[int, ...]] = None,
-    required_wavinfo: _Optional[WavInfo] = None,
+    required_samplerate: _Optional[int] = None,
+    required_bit_depth: _Optional[str] = None,
     preroll: _Optional[int] = None,
     info: bool = False,
-) -> _Union[_np.ndarray, _Tuple[_np.ndarray, WavInfo]]:
+) -> _Union[_np.ndarray, _Tuple[int, str]]:
     """
     :param filename: Where to load from
-    :param rate: Expected sample rate. `None` allows for anything.
     :param require_match: If not `None`, assert that the data you get matches the shape
-        and other characteristics of another audio file at the provided location
+        and other characteristics of another audio file at the provided location.
     :param required_shape: If not `None`, assert that the audio loaded is of shape
         `(num_samples, num_channels)`.
-    :param required_wavinfo: If not `None`, assert that the WAV info of the loaded audio
-        matches that provided.
-    :param preroll: Drop this many samples off the front
+    :param required_samplerate: Expected sample rate. `None` allows for anything.
+    :param required_bit_depth: Expected bit depth. `None` allows for anything.
+    :param preroll: Drop this number of samples from the beginning of the audio data.
     :param info: If `True`, also return the WAV info of this file.
     """
-
     def main(
         filename: _Union[str, _Path],
-        rate: _Optional[int] = None,
         require_match: _Optional[_Union[str, _Path]] = None,
         required_shape: _Optional[_Tuple[int, ...]] = None,
-        required_wavinfo: _Optional[WavInfo] = None,
+        required_samplerate: _Optional[int] = None,
+        required_bit_depth: _Optional[str] = None,
         preroll: _Optional[int] = None,
         info: bool = False,
     ):
-        x_wav = _wavio.read(str(filename))
-        assert x_wav.data.shape[1] == _REQUIRED_CHANNELS, "Mono"
-        if rate is not None and x_wav.rate != rate:
+        dry_input_file = SoundFile((str(filename)))
+        assert dry_input_file.channels == _REQUIRED_CHANNELS, "Mono"
+        if required_samplerate is not None and dry_input_file.samplerate != required_samplerate:
             raise RuntimeError(
-                f"Explicitly expected sample rate of {rate}, but found {x_wav.rate} in "
+                f"Explicitly expected sample rate of {required_samplerate}, but found {dry_input_file.samplerate} in "
                 f"file {filename}!"
             )
 
         if require_match is not None:
             assert required_shape is None
-            assert required_wavinfo is None
-            y_wav = _wavio.read(str(require_match))
-            required_shape = y_wav.data.shape
-            required_wavinfo = WavInfo(y_wav.sampwidth, y_wav.rate)
-        if required_wavinfo is not None:
-            if x_wav.rate != required_wavinfo.rate:
+            assert required_bit_depth is None
+            assert required_samplerate is None
+            file_to_match = SoundFile(str(require_match))
+            required_shape = file_to_match.channels
+            # >>> input_wav_file.extra_info
+            #   "File : 'Acid Input v1.aif' (utf-8 converted from ucs-2)\nLength : 154944092\n
+            #   FORM : 154944084\n AIFC\n  FVER : 4\n COMM : 44\n  Sample Rate : 48000\n
+            #   Frames : 19368000\n  Channels : 2\n  Sample Size : 32\n
+            #   Encoding : fl32 => 32-bit Floating Point\n SSND : 154944008\n  Offset : 0\n
+            #   Block Size : 0\n"
+            #
+            # >>> input_wav_file.format
+            #   'AIFF'
+            # >>> input_wav_file.format_info
+            #   'AIFF (Apple/SGI)'
+            # >>> input_wav_file.subtype
+            #   'FLOAT'
+            # >>> input_wav_file.subtype_info
+            #   '32 bit float'
+            required_bit_depth = file_to_match.subtype_info
+            required_samplerate = file_to_match.samplerate
+        if required_samplerate is not None:
+            if dry_input_file.samplerate != required_samplerate:
                 raise ValueError(
-                    f"Mismatched rates {x_wav.rate} versus {required_wavinfo.rate}"
+                    f"Mismatched rates {dry_input_file.samplerate} versus {required_samplerate}"
                 )
-        arr_premono = x_wav.data[preroll:] / (2.0 ** (8 * x_wav.sampwidth - 1))
+        # Safety first!
+        dry_input_file.seek(0)
+        # A two-dimensional NumPy (frames x channels) array is returned.
+        # If the SoundFile has only one channel, a one-dimensional array is returned.
+        # Use `always_2d=True` to return a two-dimensional array anyway.
+        arr_premono = dry_input_file.read[preroll:]
+        # Note that `SoundFile.read()` uses dtype='float64' by default, not the typical 'float32'!
+        # TODO: Consider allowing the user to do everything in 'float64'?
         if required_shape is not None:
             if arr_premono.shape != required_shape:
                 raise AudioShapeMismatchError(
@@ -143,10 +159,11 @@ def wav_to_np(
                     f"Mismatched shapes. Expected {required_shape}, but this is "
                     f"{arr_premono.shape}!",
                 )
-            # sampwidth fine--we're just casting to 32-bit float anyways
         arr = arr_premono[:, 0]
-        return arr if not info else (arr, WavInfo(x_wav.sampwidth, x_wav.rate))
+        return arr if not info else (arr, (dry_input_file.samplerate, dry_input_file.subtype_info))
 
+    # I'm leaving the `librosa` fallback as-is for now.
+    # TODO: Refactor this to not rely on `wavio`, and use `soundfile` instead.
     def librosa_fallback(
         filename: _Union[str, _Path],
         rate: _Optional[int] = None,
@@ -204,13 +221,13 @@ def wav_to_np(
     try:
         return main(
             filename=filename,
-            rate=rate,
             require_match=require_match,
             required_shape=required_shape,
-            required_wavinfo=required_wavinfo,
+            required_samplerate=required_samplerate,
+            required_bit_depth=required_bit_depth,
             preroll=preroll,
             info=info,
-        )
+         )
     except _wave.Error:
         return librosa_fallback(
             filename=filename,
@@ -225,45 +242,68 @@ def wav_to_np(
 
 def wav_to_tensor(
     *args, info: bool = False, **kwargs
-) -> _Union[_torch.Tensor, _Tuple[_torch.Tensor, WavInfo]]:
-    out = wav_to_np(*args, info=info, **kwargs)
+) -> _Union[_torch.Tensor, _Tuple[_torch.Tensor, _Tuple[int, str]]]:
+    """:param info: If `True`, also return a Tuple with the sample rate and bit depth of this file."""
+    np_array_and_maybe_samplerate_and_bit_depth = wav_to_np(*args, info=info, **kwargs)
     if info:
-        arr, info = out
-        return _torch.Tensor(arr), info
+        numpy_array, info = np_array_and_maybe_samplerate_and_bit_depth
+        return _torch.Tensor(numpy_array), info
     else:
-        arr = out
-        return _torch.Tensor(arr)
+        numpy_array = np_array_and_maybe_samplerate_and_bit_depth
+        return _torch.Tensor(numpy_array)
 
 
 def tensor_to_wav(x: _torch.Tensor, *args, **kwargs):
+    """Side effect: writes an audio file to storage."""
+    # Move the data from the accelerator (typically a CUDA GPU) to CPU:
+    # https://discuss.pytorch.org/t/should-it-really-be-necessary-to-do-var-detach-cpu-numpy/35489
+    #
+    # `tensor.detach().cpu()` is preferred over `tensor.cpu().detach()` to avoid unnecessary
+    # autograd edge construction.
     np_to_wav(x.detach().cpu().numpy(), *args, **kwargs)
 
 
 def np_to_wav(
-    x: _np.ndarray,
+    numpy_array: _np.ndarray,
     filename: _Union[str, _Path],
-    rate: int = 48_000,
-    sampwidth: int = 3,
-    scale=None,
+    samplerate: int = 48_000,
+    bit_depth: str = '32 bit float',
     **kwargs,
 ):
-    if _wavio.__version__ <= "0.0.4" and scale is None:
-        scale = "none"
-    _wavio.write(
-        str(filename),
-        (_np.clip(x, -1.0, 1.0) * (2 ** (8 * sampwidth - 1))).astype(_np.int32),
-        rate,
-        scale=scale,
-        sampwidth=sampwidth,
-        **kwargs,
-    )
+    """See `soundfile.available_formats()` and `soundfile.available_subtypes()` for options."""
+    max_value = numpy_array.max()
+    min_value = numpy_array.min()
+    if min_value < -1.0 or max_value > 1.0:
+        print(f"""
+              NumPy array which will be written to {filename} will be hard clipped!
+              numpy_array.min() < -1.0: {min_value}
+              numpy_array.max() > 1.0: {max_value}
+              """)
+    # Anything above 1.0 is reduced to 1.0. Anything below -1 is reduced to -1.
+    # TODO: Consider whether or not this introduces unwanted digital hard clipping.
+    print(f"""
+          Exporting {str(filename)} with {_REQUIRED_CHANNELS} channels,
+          {samplerate} sample rate, and {bit_depth} bit depth...
+          """
+    # 'w' for writing (truncates file) or 'x' for writing (raises an error if file already exists).
+    #
+    # pprint.pprint(soundfile.available_subtypes('WAV'))
+    #   {...
+    #   'DOUBLE': '64 bit float',
+    #   'FLOAT': '32 bit float',
+    #   ...
+    #   'PCM_16': 'Signed 16 bit PCM',
+    #   'PCM_24': 'Signed 24 bit PCM',
+    #   'PCM_32': 'Signed 32 bit PCM',
+    #   ...}
+    with SoundFile(str(filename), 'x', samplerate, _REQUIRED_CHANNELS, bit_depth, 'FLOAT') as f:
+        f.write(_np.clip(numpy_array, a_min=-1.0, a_max=1.0))
 
 
 class DatasetModelHandshakeError(_HandshakeError):
     """
     Raised if a handshake fails from dataset to model
     """
-
     pass
 
 
@@ -317,9 +357,9 @@ class StopError(StartStopError):
 _DEFAULT_REQUIRE_INPUT_PRE_SILENCE = 0.4
 
 
-def _sample_to_time(s, rate):
-    seconds = s // rate
-    remainder = s % rate
+def _samples_to_time(samples, samplerate):
+    seconds = samples // samplerate
+    remainder = samples % samplerate
     hours, minutes = 0, 0
     seconds_per_hour = 3600
     while seconds >= seconds_per_hour:
@@ -339,8 +379,8 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
 
     def __init__(
         self,
-        x: _torch.Tensor,
-        y: _torch.Tensor,
+        dry_audio_tensor: _torch.Tensor,
+        wet_audio_tensor: _torch.Tensor,
         nx: int,
         ny: _Optional[int],
         start: _Optional[int] = None,
@@ -360,8 +400,8 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         ] = _DEFAULT_REQUIRE_INPUT_PRE_SILENCE,
     ):
         """
-        :param x: The input signal. A 1D array.
-        :param y: The associated output from the model. A 1D array.
+        :param dry_audio_tensor: 'x' The input signal. A 1D array.
+        :param wet_audio_tensor: 'y' The associated output from the model. A 1D array.
         :param nx: The number of samples required as input for the model. For example,
             for a ConvNet, this would be the receptive field.
         :param ny: How many samples to provide as the output array for a single "datum".
@@ -388,7 +428,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         :param y_scale: Multiplies the output signal by a factor (e.g. if the data are
             too quiet).
         :param input_gain: In dB. If the input signal wasn't fed to the amp at unity
-            gain, you can indicate the gain here. The data set will multiply the raw
+            gain, you can indicate the gain here. The dataset will multiply the raw
             audio file by the specified gain so that the true input signal amplitude
             experienced by the signal chain will be provided as input to the model. If
             you are using a reamping setup, you can estimate this by reamping a
@@ -400,11 +440,11 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
             If it's not, then raise an exception because the output due to it will leak
             into the data set that we're trying to use. If `None`, don't assert.
         """
-        self._validate_x_y(x, y)
+        self._validate_x_y(dry_audio_tensor, wet_audio_tensor)
         self._sample_rate = sample_rate
         start, stop = self._validate_start_stop(
-            x,
-            y,
+            dry_audio_tensor,
+            wet_audio_tensor,
             start,
             stop,
             start_samples,
@@ -415,38 +455,46 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         )
         if require_input_pre_silence is not None:
             self._validate_preceding_silence(
-                x, start, require_input_pre_silence, self.sample_rate
+                dry_audio_tensor, start, require_input_pre_silence, self.sample_rate
             )
-        x, y = [z[start:stop] for z in (x, y)]
+        # Clip start and and end of both audio file data tensors
+        dry_audio_tensor, wet_audio_tensor = [z[start:stop] for z in (dry_audio_tensor, wet_audio_tensor)]
         if delay is not None and delay != 0:
-            x, y = self._apply_delay(x, y, delay)
+            dry_audio_tensor, wet_audio_tensor = self._apply_delay(dry_audio_tensor, wet_audio_tensor, delay)
+        # Decibel scale in terms of Voltage gain/loss is 20 log 10
         x_scale = 10.0 ** (input_gain / 20.0)
-        x = x * x_scale
-        y = y * y_scale
+        dry_audio_tensor = dry_audio_tensor * x_scale
+        wet_audio_tensor = wet_audio_tensor * y_scale
         self._x_path = x_path
         self._y_path = y_path
-        self._validate_inputs_after_processing(x, y, nx, ny)
-        self._x = x
-        self._y = y
+        self._validate_inputs_after_processing(dry_audio_tensor, wet_audio_tensor, nx, ny)
+        self._x = dry_audio_tensor
+        self._y = wet_audio_tensor
         self._nx = nx
-        self._ny = ny if ny is not None else len(x) - nx + 1
+        # If the two files are, for example, both 48000 samples long:
+        #   If nx = 4096 and ny = None:
+        #     ny = 48000 - 4096 + 1
+        self._ny = ny if ny is not None else len(dry_audio_tensor) - nx + 1
 
     def __getitem__(self, idx: int) -> _Tuple[_torch.Tensor, _torch.Tensor]:
         """
         :return:
-            Input (NX+NY-1,)
+            Input (NX + NY - 1,)
             Output (NY,)
         """
         if idx >= len(self):
             raise IndexError(f"Attempted to access datum {idx}, but len is {len(self)}")
+        # TODO: Replace all of these obtuse and overly terse variable names with more descriptive names.
         i = idx * self._ny
         j = i + self.y_offset
         return self.x[i : i + self._nx + self._ny - 1], self.y[j : j + self._ny]
 
     def __len__(self) -> int:
-        n = len(self.x)
+        n = len(self.dry_audio_tensor)
         # If ny were 1
         single_pairs = n - self._nx + 1
+        # Number of slices of size NY in the input dry_audio_tensor
+        # Floor division rounds down. This correlates with the setting `drop_last = True`.
         return single_pairs // self._ny
 
     @property
@@ -548,35 +596,35 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
     @classmethod
     def _apply_delay(
         cls,
-        x: _torch.Tensor,
-        y: _torch.Tensor,
+        dry_audio_tensor: _torch.Tensor,
+        wet_audio_tensor: _torch.Tensor,
         delay: _Union[int, float],
     ) -> _Tuple[_torch.Tensor, _torch.Tensor]:
         # Check for floats that could be treated like ints (simpler algorithm)
         if isinstance(delay, float) and int(delay) == delay:
             delay = int(delay)
         if isinstance(delay, int):
-            return cls._apply_delay_int(x, y, delay)
+            return cls._apply_delay_int(dry_audio_tensor, wet_audio_tensor, delay)
         else:
             raise TypeError(type(delay))
 
     @classmethod
     def _apply_delay_int(
-        cls, x: _torch.Tensor, y: _torch.Tensor, delay: int
+        cls, dry_audio_tensor: _torch.Tensor, wet_audio_tensor: _torch.Tensor, delay: int
     ) -> _Tuple[_torch.Tensor, _torch.Tensor]:
         if delay > 0:
-            x = x[:-delay]
-            y = y[delay:]
+            dry_audio_tensor = dry_audio_tensor[:-delay]
+            wet_audio_tensor = wet_audio_tensor[delay:]
         elif delay < 0:
-            x = x[-delay:]
-            y = y[:delay]
+            dry_audio_tensor = dry_audio_tensor[-delay:]
+            wet_audio_tensor = wet_audio_tensor[:delay]
         return x, y
 
     @classmethod
     def _validate_start_stop(
         cls,
-        x: _torch.Tensor,
-        y: _torch.Tensor,
+        dry_audio_tensor: _torch.Tensor,
+        wet_audio_tensor: _torch.Tensor,
         start: _Optional[int] = None,
         stop: _Optional[int] = None,
         start_samples: _Optional[int] = None,
@@ -647,12 +695,12 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         # explicit makes the error messages better for users.
         if start is None and stop is None:
             return start, stop
-        if len(x) != len(y):
+        if len(dry_audio_tensor) != len(wet_audio_tensor):
             raise ValueError(
-                f"Input and output are different length. Input has {len(x)} samples, "
-                f"and output has {len(y)}"
+                f"Input and output are different length. Input has {len(dry_audio_tensor)} samples, "
+                f"and output has {len(wet_audio_tensor)}"
             )
-        n = len(x)
+        n = len(dry_audio_tensor)
         if start is not None:
             # Start after the files' end?
             if start >= n:
@@ -680,7 +728,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
                     "which is before the beginning of the array!"
                 )
         # Just in case...
-        if len(x[start:stop]) == 0:
+        if len(dry_audio_tensor[start:stop]) == 0:
             raise StartStopError(
                 f"Array length {n} with start={start} and stop={stop} would get "
                 "rid of all of the data!"
@@ -688,28 +736,28 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         return start, stop
 
     @classmethod
-    def _validate_x_y(self, x, y):
-        if len(x) != len(y):
+    def _validate_x_y(self, dry_audio_tensor, wet_audio_tensor):
+        if len(dry_audio_tensor) != len(wet_audio_tensor):
             raise XYError(
-                f"Input and output aren't the same lengths! ({len(x)} vs {len(y)})"
+                f"Input and output aren't the same lengths! ({len(dry_audio_tensor)} vs {len(wet_audio_tensor)})"
             )
         # TODO channels
-        n = len(x)
+        n = len(dry_audio_tensor)
         if n == 0:
             raise XYError("Input and output are empty!")
 
-    def _validate_inputs_after_processing(self, x, y, nx, ny):
-        assert x.ndim == 1
-        assert y.ndim == 1
-        assert len(x) == len(y)
-        if nx > len(x):
+    def _validate_inputs_after_processing(self, dry_audio_tensor, wet_audio_tensor, nx, ny):
+        assert dry_audio_tensor.ndim == 1
+        assert wet_audio_tensor.ndim == 1
+        assert len(dry_audio_tensor) == len(wet_audio_tensor)
+        if nx > len(dry_audio_tensor):
             raise RuntimeError(  # TODO XYError?
-                f"Input of length {len(x)}, but receptive field is {nx}."
+                f"Input of length {len(dry_audio_tensor)}, but receptive field is {nx}."
             )
         if ny is not None:
-            assert ny <= len(y) - nx + 1
-        if _torch.abs(y).max() >= 1.0:
-            msg = "Output clipped."
+            assert ny <= len(wet_audio_tensor) - nx + 1
+        if _torch.abs(wet_audio_tensor).max() >= 1.0:
+            msg = "Output clipped! _torch.abs(wet_audio_tensor).max() >= 1.0"
             if self._y_path is not None:
                 msg += f"Source is {self._y_path}"
             raise ValueError(msg)
@@ -717,7 +765,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
     @classmethod
     def _validate_preceding_silence(
         cls,
-        x: _torch.Tensor,
+        dry_audio_tensor: _torch.Tensor,
         start: _Optional[int],
         silent_seconds: float,
         sample_rate: _Optional[float],
@@ -746,7 +794,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         raw_check_start = start - silent_samples
         check_start = max(raw_check_start, 0) if start >= 0 else min(raw_check_start, 0)
         check_end = start
-        if not _torch.all(x[check_start:check_end] == 0.0):
+        if not _torch.all(dry_audio_tensor[check_start:check_end] == 0.0):
             raise XYError(
                 f"Input provided isn't silent for at least {silent_samples} samples "
                 "before the starting index. Responses to this non-silent input may "
@@ -755,10 +803,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
 
 
 class ConcatDatasetValidationError(ValueError):
-    """
-    Error raised when a ConcatDataset fails validation
-    """
-
+    """Error raised when a ConcatDataset fails validation"""
     pass
 
 
@@ -775,9 +820,7 @@ class ConcatDataset(AbstractDataset, _InitializableFromConfig):
         return self.datasets[i][j]
 
     def __len__(self) -> int:
-        """
-        How many data sets are in this data set
-        """
+        """How many sub-datasets are in this dataset"""
         return sum(len(d) for d in self._datasets)
 
     @property
@@ -872,7 +915,7 @@ def register_dataset_initializer(
     name: str, constructor: _Callable[[_Any], AbstractDataset], overwrite=False
 ):
     """
-    If you have other data set types, you can register their initializer by name using
+    If you have other dataset types, you can register their initializer by name using
     this.
 
     For example, the basic NAM is registered by default under the name "default", but if
@@ -881,7 +924,7 @@ def register_dataset_initializer(
     >>> from nam import data
     >>> data.register_dataset_initializer("parametric", MyParametricDataset.init_from_config)
 
-    :param name: The name that'll be used in the config to ask for the data set type
+    :param name: The name that'll be used in the config to ask for the dataset type
     :param constructor: The constructor that'll be fed the config.
     """
     if name in _dataset_init_registry and not overwrite:

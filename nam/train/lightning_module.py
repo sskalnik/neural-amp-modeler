@@ -30,6 +30,9 @@ import torch.nn as _nn
 
 from .._core import InitializableFromConfig as _InitializableFromConfig
 from .._dependencies import auraloss as _auraloss
+# Based on AIDA-X and GuitarML / CoreAudioML
+# Primary purpose is A-weighted + low-pass pre-emphasis filter
+from .._dependencies.auraloss.perceptual import PreEmph
 from ..models.base import BaseNet as _BaseNet
 from ..models.conv_net import ConvNet as _ConvNet
 from ..models.linear import Linear as _Linear
@@ -62,6 +65,7 @@ class ValidationLoss(_Enum):
 
     MSE = "mse"
     ESR = "esr"
+    ESRPREEMPH = 'esrpreemph'
 
 
 class _CustomLoss(_NamedTuple):
@@ -81,14 +85,10 @@ class LossConfig(_InitializableFromConfig):
         provided, then it must match the name of a custom loss.
     :param pre_emph_coef: Coefficient of 1st-order pre-emphasis filter from
         https://www.mdpi.com/2076-3417/10/3/766. Paper value: 0.95.
-    :param pre_
     """
 
     class ValLossNameError(ValueError):
-        """
-        Error thrown when a validation loss name is invalid.
-        """
-
+        """Error thrown when a validation loss name is invalid."""
         pass
 
     mse_weight: _Optional[float] = 1.0
@@ -96,7 +96,7 @@ class LossConfig(_InitializableFromConfig):
     fourier: bool = False
     mask_first: int = 0
     dc_weight: float = None
-    val_loss: _Union[ValidationLoss, str] = ValidationLoss.MSE
+    val_loss: _Union[ValidationLoss, str] = ValidationLoss.ESRPREEMPH
     pre_emph_weight: _Optional[float] = None
     pre_emph_coef: _Optional[float] = None
     pre_emph_mrstft_weight: _Optional[float] = None
@@ -335,6 +335,7 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
             # "esr" -> "ESR"
             # "mse" -> "MSE"
             # Others unsupported...
+            # TODO: support others!!!
             # TODO better mapping from Enum to dict keys
             val_loss_type = self._loss_config.val_loss
             val_loss_key_for_loss_dict = (
@@ -359,7 +360,7 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         )
         return val_loss
 
-    def _esr_loss(self, preds: _torch.Tensor, targets: _torch.Tensor) -> _torch.Tensor:
+    def _esr_loss(self, preds: _torch.Tensor, targets: _torch.Tensor, device: _Optional[_torch.device] = None) -> _torch.Tensor:
         """
         Error signal ratio aka ESR loss.
 
@@ -373,12 +374,17 @@ class LightningModule(_pl.LightningModule, _InitializableFromConfig):
         :param targets: (B,L)
         :return: ()
         """
-        return _esr(preds, targets)
+        if device:
+            # esr with A-weighted + LP pre-emphasis filter"""
+            pre_emph_filter = PreEmph(filter_type='awlp', fs=48000)
+            pre_emph_filter.to(device)
+            preds, targets = pre_emph_filter(preds, targets)
+            return _esr(preds, targets)
+        else:
+            return _esr(preds, targets)
 
     def _get_loss_dict(self, preds, targets) -> _Dict[str, _LossItem]:
-        """
-        Compute all of the losses.
-        """
+        """Compute all of the losses."""
         # Compute all relevant losses.
         loss_dict = {}  # Mind keys versus validation loss requested...
 

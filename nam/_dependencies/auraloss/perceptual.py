@@ -2,6 +2,9 @@ import torch
 import numpy as np
 
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 class SumAndDifference(torch.nn.Module):
     """Sum and difference signal extraction module."""
 
@@ -52,7 +55,7 @@ class FIRFilter(torch.nn.Module):
     Folded differentiator - "fd"
 
     Note that the default coefficeint value of 0.85 is optimized for
-    a sampling rate of 44.1 kHz, considering adjusting this value at differnt sampling rates.
+    a sampling rate of 44.1 kHz, considering adjusting this value at different sampling rates.
     """
 
     def __init__(self, filter_type="hp", coef=0.85, fs=44100, ntaps=101, plot=False):
@@ -130,3 +133,40 @@ class FIRFilter(torch.nn.Module):
             target, self.fir.weight.data, padding=self.ntaps // 2
         )
         return input, target
+
+
+class PreEmph(torch.nn.Module):
+    def __init__(self, filter_type='awlp', fs=48000):
+        super(PreEmph, self).__init__()
+        self.preemph = None
+        self._preemph = None
+        if filter_type == 'hp':
+            a1 = (5.9659e+03 * 2 * 3.1416) / fs # Desired hp f = 5.9659e+03 Hz
+            self.preemph = FIRFilter(filter_type='hp', coef=a1, fs=fs)
+        elif filter_type == 'fd':
+            a1 = (5.9659e+03 * 2 * 3.1416) / fs # Desired hp f = 5.9659e+03 Hz
+            self.preemph = FIRFilter(filter_type='fd', coef=a1, fs=fs)
+        elif filter_type == 'aw':
+            # Standard A-weghting
+            self.preemph = FIRFilter(filter_type=filter_type, coef=None, fs=fs)
+        elif filter_type == 'awlp':
+            # [Wright & Välimäki, 2019](https://arxiv.org/abs/1911.08922)
+            # A-weighting with low-pass filter
+            self.preemph = FIRFilter(filter_type='aw', coef=None, fs=fs)
+            # Also consider 8.5e+03
+            # https://github.com/AidaDSP/Automated-GuitarAmpModelling/blob/9444c173958ba86aaba8b27ec55114ef3b277cba/proc_audio.py#L62
+            # See also:
+            # https://github.com/MaxPayne86/CoreAudioML/blob/9f55f662302af6b3e0318e350dcf681f316e8562/training.py#L71
+            a1 = (5.9659e+03 * 2 * 3.1416) / fs # Desired lp f = 5.9659e+03 Hz
+            self._preemph = FIRFilter(filter_type='hp', coef=-a1, fs=fs, ntaps=3) # Note: hp with -coef = lp see Auraloss impl.
+
+    def forward(self, input, target):
+        if self.preemph and self._preemph:
+            input, target = self.preemph(input, target)
+            input, target = self._preemph(input, target)
+            return input, target
+        elif self.preemph:
+            input, target = self.preemph(input, target)
+            return input, target
+        else:
+            return input, target

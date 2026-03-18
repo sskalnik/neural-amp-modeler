@@ -53,12 +53,20 @@ from . import metadata as _metadata
 from pytorch_lightning.loggers import TensorBoardLogger
 
 
+# Force both matrix operations and convolutions to use full 32-bit float Tensor Cores:
+# https://docs.pytorch.org/docs/stable/notes/numerical_accuracy.html#tensorfloat-32-tf32-on-nvidia-ampere-and-later-devices
+_torch.backends.cudnn.conv.fp32_precision = "ieee"
+
+
 # Training using the simplified trainers in NAM is done at 48k.
 STANDARD_SAMPLE_RATE = 48_000.0
 
-# Default number of samples per (mini)batch datum to pull from the wet audio file.
+# Default number of samples per (mini)batch datum to pull from the model output.
 # Lots more info here: https://www.thegearpage.net/board/index.php?threads/nam-hyper-accuracy-captures.2543142/post-43368443
 #
+# I can't remember if these figures were for 32-true or bf16-mixed...
+# Also, I can't remember if these figures were with stock Adam or AdamW8bit...
+# TODO: Collect more data and publish stats!
 # NY = 64436 (2^16) instead of 8192 (2^13), so 8x larger
 # batch_size = 32
 # Number of steps per epoch becomes 3.
@@ -74,12 +82,17 @@ STANDARD_SAMPLE_RATE = 48_000.0
 # REVyHI uses about 5 GB of VRAM.
 # REVxSTD uses about 4 GB of VRAM.
 # Standard uses about 4 GB of VRAM.
-#
 _NY_DEFAULT = 8192
+
+_CAB_MRSTFT_PRE_EMPH_WEIGHT = 2.0e-4
+_CAB_MRSTFT_PRE_EMPH_COEF = 0.85
+
+_DELAY_CALIBRATION_ABS_THRESHOLD = 0.0003
+_DELAY_CALIBRATION_REL_THRESHOLD = 0.001
+_DELAY_CALIBRATION_SAFETY_FACTOR = 0
 
 
 class Architecture(_Enum):
-    ULTRA = "ultra"
     COMPLEX = "complex"
     REVYHI = "revyhi"
     REVYSTD = 'revystd'
@@ -124,7 +137,7 @@ def _detect_input_version(input_path) -> _Tuple[_Version, bool]:
             "ede3b9d82135ce10c7ace3bb27469422": _Version(2, 0, 0),
             "36cd1af62985c2fac3e654333e36431e": _Version(3, 0, 0),
             "80e224bd5622fd6153ff1fd9f34cb3bd": _PROTEUS_VERSION,
-            "da855e733594f966859001b777f68b69": _Version(5, 0, 0),
+            "3a126f4bee0627f0941a6e20ec3ea20d": _Version(5, 0, 0),
         }.get(file_hash)
         if version is None:
             print(
@@ -199,6 +212,7 @@ def _detect_input_version(input_path) -> _Tuple[_Version, bool]:
                 start_hash = _hash(x[: int(1 * _V4_DATA_INFO.rate)])
                 return start_hash
 
+            # TODO: I don't know exactly what is going on here lol
             def assign_hashes_v5(path) -> Hashes:
                 # Use this to create recognized hashes for new files
                 x, info = _wav_to_np(path, info=True)
@@ -307,10 +321,7 @@ def _detect_input_version(input_path) -> _Tuple[_Version, bool]:
 
 
 class _DataInfo(_BaseModel):
-    """
-    :param major_version: Data major version
-    """
-
+    """:param major_version: Data major version"""
     major_version: int
     rate: _Optional[float]
     t_blips: int
@@ -322,6 +333,7 @@ class _DataInfo(_BaseModel):
     blip_locations: _Sequence[_Sequence[int]]
 
 
+# ESR will be plotted from 10_000 to 101_000
 _V1_DATA_INFO = _DataInfo(
     major_version=1,
     rate=STANDARD_SAMPLE_RATE,
@@ -333,6 +345,8 @@ _V1_DATA_INFO = _DataInfo(
     noise_interval=(0, 6000),
     blip_locations=((12_000, 36_000),),
 )
+
+# ESR will be plotted from 10_000 to 101_000
 # V2:
 # (0:00-0:02) Blips at 0:00.5 and 0:01.5
 # (0:02-0:05) Chirps
@@ -353,6 +367,8 @@ _V2_DATA_INFO = _DataInfo(
     noise_interval=(12_000, 18_000),
     blip_locations=((24_000, 72_000), (-72_000, -24_000)),
 )
+
+# ESR will be plotted from 10_000 to 101_000
 # V3:
 # (0:00-0:09) Validation 1
 # (0:09-0:10) Silence
@@ -387,6 +403,7 @@ _V3_DATA_INFO = _DataInfo(
 # train_kwargs = {"start_samples": data_info.train_start, "stop_samples": train_stop}
 # validation_kwargs = {"start_samples": validation_start}
 
+# ESR will be plotted from 10_000 to 101_000
 # V4 (aka GuitarML Proteus)
 # https://github.com/GuitarML/Releases/releases/download/v1.0.0/Proteus_Capture_Utility.zip
 # * 44.1k
@@ -412,35 +429,41 @@ _V4_DATA_INFO = _DataInfo(
     blip_locations=((22_050,),),
 )
 
-# V5 = S3 Sound's "acid test"
-# (0:00.000-0:02.000) Silence
-# (0:02.000-0:03.000) Blips at 0:2.0 and 0:3.0 (2 seconds and 3 seconds)
-# (5:29.000-6:49.500) Validation 1 = 15_792_000 : 19_656_000. The delta is 1:20:500, or 80.5 seconds, or 3_864_000 samples at 48_000 kHz.
+# V5 = S3 Sound's "acid test". This is meant for TB-303-style acid synths, not guitars!
+#
+# ESR will be plotted from 96_000 to 108_000.
+# 120 BPM = 2 seconds per bar = 500 ms per 1/4 note = 125 ms per 1/16 note.
+# 1/4 = 24_000, 1/8 = 12_000, 1/16 = 6_000 samples @ 48_000 Hz sample rate.
+#
+# Minutes:Seconds.Samples
+# (00:00.000 - 00:02.000) = Silence [0:96_000]
+# (00:02.000 - 01:10.000) = Validation 1 [96_000:3_360_000] 1:08 length, 70 * 48000 = 3360000
+# (01:10.000 - 01:10.499) = Silence before Blip 1 [3_360_000:3_384_000]
+# (01:10.500)             = Blip 1 @ 3_384_000
+# (01:10.501 - 01:11:499) = Silence between Blip 1 and Blip 2
+# (01:11.500)             = Blip 2 @ 3_432_000
+# (01:11.501 - 01:12.000) = Silence between Blip 2 and Operator white noise C3 (discontinuity?)
+# (01:12.000 - 09:04.000) = Training data (Technically the final sine sweep ends at 09:04.000) [3_456_000:26_112_000]
+# (09:04.000 - 09:04:500) = Silence between sine sweep audio end and Validation 2 audio start
+# (09:04.500 - 10:12.500) = Validation 2 [26_136_000:29_400_000]
+# (10:12.500 - 10:14.000) = Silence
+# (10:14.000)             = EOF @ 29_472_000
 _V5_DATA_INFO = _DataInfo(
     major_version=5,
     rate=STANDARD_SAMPLE_RATE,
-    t_blips=96_000,           # time window in which to find the two blips: 2 seconds, with one blip in the middle of each second
-    first_blips_start=72_000, # ((first blip position in seconds - .5 seconds) * sample rate)
-    t_validate=3_864_000,     # 5:29.000 to 6:49.500 = 15_792_000 : 19_656_000. The delta is 1:20:500, or 80.5 seconds, or 3_864_000 samples at 48_000 kHz.
-    train_start=72_000,
-    validation_start=15_792_000,     # 5:29.000
-    noise_interval=(84_000, 90_000), # silence before the first blip, establishing the wet "output" file's noise floor. Why is it 6000 samples? ¯\_(ツ)_/¯
-    blip_locations=((96_000, 144_000),), # Actual locations of each of the two blips
+    t_blips=96_000,               # time window in which to find the two blips: 2 seconds, with one blip in the middle of each second
+    first_blips_start=3_360_000, # ((first blip position in seconds - .5 seconds) * sample rate)
+    t_validate=3_264_000,         # 01:08.000 = 68 * 48000 = 3_264_000
+    train_start=3_456_000,        # 01:12.000 = 72 * 48000 = 3_456_000
+    validation_start=-3_360_000,  # -01:09.500 = 1:08.000 + 1.5 seconds trailing silence. ((9 * 60) + 4.5) * 48000 = 26_136_000 absolute position. (29_472_000 - (((9 * 60) + 4.5) * 48000)) / 48000 = 69.5
+    noise_interval=(3_372_000, 3_378_000), # silence for 125ms in length, 250ms before the first blip, establishing the wet "output" file's noise floor.
+    blip_locations=((3_384_000, 3_432_000),), # Actual locations of each of the two blips
 )
-# FYI, this is how the validation slicing is done in _check_v5:
-#    y = _wav_to_tensor(output_path, rate=rate)
-#    n = len(_wav_to_tensor(input_path)) # to End-crop output
-#    wet_audio_validation_segment_1 = y[_V5_DATA_INFO.validation_start : (_V5_DATA_INFO.validation_start + _V5_DATA_INFO.t_validate)]
-#       = 15_792_000 : 19_656_000
-#    wet_audio_validation_segment_2 = y[n - _V3_DATA_INFO.t_validate : n]
-#       = (len(input.wav)  - 432_000) : len(input.wav)
-#
-# 5:29.000 to 6:49.500 = 15_792_000 : 19_656_000. The delta is 1:20:500, or 80.5 seconds, or 3_864_000 samples at 48_000 kHz.
-# 7:52.000 to 9:12.500 = 22_656_000 : 26_520_000. The delta is 1:20:500, or 80.5 seconds, or 3_864_000 samples at 48_000 kHz.
-
-_DELAY_CALIBRATION_ABS_THRESHOLD = 0.0003
-_DELAY_CALIBRATION_REL_THRESHOLD = 0.001
-_DELAY_CALIBRATION_SAFETY_FACTOR = 0
+# FYI, from _get_data_config:
+# validation_start = data_info.validation_start
+# train_stop = validation_start
+# train_kwargs = {"start_samples": data_info.train_start, "stop_samples": train_stop}
+# validation_kwargs = {"start_samples": validation_start}
 
 
 def _warn_lookaheads(indices: _Sequence[int]) -> str:
@@ -510,18 +533,18 @@ def _calibrate_latency_v_all(
     lookahead = 1_000
     lookback = 10_000
     # Calibrate the level for the trigger:
-    y = y[data_info.first_blips_start : data_info.first_blips_start + data_info.t_blips]
+    end_of_blip_search_range = data_info.first_blips_start + data_info.t_blips
+    print(f"Scanning for two dirac pulse 'blips' in sample range {data_info.first_blips_start} to {end_of_blip_search_range}...")
+    y = y[data_info.first_blips_start:end_of_blip_search_range]
     # Calculate the max amplitude of the background noise within data_info.noise_interval
+    noise_interval_before_dirac_pulse_blip = data_info.noise_interval[0] - data_info.first_blips_start
+    noise_interval_after_dirac_pulse_blip = data_info.noise_interval[1] - data_info.first_blips_start
     background_level = _np.max(
         _np.abs(
-            y[
-                data_info.noise_interval[0]
-                - data_info.first_blips_start : data_info.noise_interval[1]
-                - data_info.first_blips_start
-            ]
+            y[noise_interval_before_dirac_pulse_blip:noise_interval_after_dirac_pulse_blip]
         )
     )
-    print(f"background_level is {background_level}")
+    print(f"background_level = {background_level} based on a scan from {noise_interval_before_dirac_pulse_blip} to {noise_interval_after_dirac_pulse_blip}")
     print(f"rel_threshold is {rel_threshold}")
     # Which is larger? The background noise from the previous step + abs_threshold, or (1.0 + rel_threshold) * the background noise?
     trigger_threshold = max(
@@ -539,7 +562,6 @@ def _calibrate_latency_v_all(
         # Stop at 10_000 samples after the blip location
         stop_looking = i_rel + lookback
         y_scans.append(y[start_looking:stop_looking])
-    print(f"y_scans is {y_scans}")
     y_scan_average = _np.mean(_np.stack(y_scans), axis=0)
     triggered = _np.where(_np.abs(y_scan_average) > trigger_threshold)[0]
     if len(triggered) == 0:  # No impulse responses were detected; can't calibrate
@@ -608,12 +630,8 @@ def _plot_latency_v_all(
     data_info: _DataInfo, latency: int, input_path: str, output_path: str, _nofail=True
 ):
     print("Plotting the latency for manual inspection...")
-    x = _wav_to_np(input_path)[
-        data_info.first_blips_start : data_info.first_blips_start + data_info.t_blips
-    ]
-    y = _wav_to_np(output_path)[
-        data_info.first_blips_start : data_info.first_blips_start + data_info.t_blips
-    ]
+    x = _wav_to_np(input_path)[data_info.first_blips_start : data_info.first_blips_start + data_info.t_blips]
+    y = _wav_to_np(output_path)[data_info.first_blips_start : data_info.first_blips_start + data_info.t_blips]
     # Only get the blips we really want.
     i = _np.where(_np.abs(x) > 0.5 * _np.abs(x).max())[0]
     if len(i) == 0:
@@ -622,9 +640,7 @@ def _plot_latency_v_all(
             "Plotting the input and output; there should be spikes at around the "
             "marked locations."
         )
-        t = _np.arange(
-            data_info.first_blips_start, data_info.first_blips_start + data_info.t_blips
-        )
+        t = _np.arange(data_info.first_blips_start, data_info.first_blips_start + data_info.t_blips)
         expected_spikes = data_info.blip_locations[0]  # For v1 specifically
         fig, axs = _plt.subplots(len((x, y)), 1)
         for ax, curve in zip(axs, (x, y)):
@@ -659,10 +675,7 @@ _plot_latency_v5 = _partial(_plot_latency_v_all, _V5_DATA_INFO)
 
 
 class _AnalyzeLatencyError(RuntimeError):
-    """
-    Raised when the latency analysis fails.
-    """
-
+    """Raised when the latency analysis fails."""
     pass
 
 
@@ -735,10 +748,6 @@ def get_lstm_config(architecture):
     }[architecture]
 
 
-def _check_v1(*args, **kwargs) -> _metadata.DataChecks:
-    return _metadata.DataChecks(version=1, passed=True)
-
-
 def _esr_validation_replicate_msg(threshold: float) -> str:
     return (
         f"Validation replicates have a self-ESR of over {threshold}. "
@@ -749,6 +758,10 @@ def _esr_validation_replicate_msg(threshold: float) -> str:
         " * Some knob got moved while reamping.\n"
         " * You started reamping before the amp had time to warm up fully."
     )
+
+
+def _check_v1(*args, **kwargs) -> _metadata.DataChecks:
+    return _metadata.DataChecks(version=1, passed=True)
 
 
 def _check_v2(
@@ -924,23 +937,36 @@ def _check_v5(
     with _torch.no_grad():
         print("V5 checks...")
         rate = _V5_DATA_INFO.rate
+
         wet_audio_tensor = _wav_to_tensor(output_path, rate=rate)
-        dry_audio_tensor_len = len(_wav_to_tensor(input_path))
-        # Hard-coding 7:52.000, or 22_656_000 samples, because I realized too late how the dataset is created by splitting up the audio file(s).
+        # Minutes:Seconds.Samples
+        # (00:00.000 - 00:02.000) = Silence [0:96_000]
+        # (00:02.000 - 01:10.000) = Validation 1 [96_000:3_360_000] 1:08 length, 70 * 48000 = 3360000
+        # (01:10.000 - 01:10.499) = Silence before Blip 1 [3_360_000:3_384_000]
+        # (01:10.500)             = Blip 1 @ 3_384_000
+        # (01:10.501 - 01:11:499) = Silence between Blip 1 and Blip 2
+        # (01:11.500)             = Blip 2 @ 3_432_000
+        # (01:11.501 - 01:12.000) = Silence between Blip 2 and Operator white noise C3 (discontinuity?)
+        # (01:12.000 - 09:04.000) = Training data (Technically the final sine sweep ends at 09:04.000) [3_456_000:26_112_000]
+        # (09:04.000 - 09:04:500) = Silence between sine sweep audio end and Validation 2 audio start
+        # (09:04.500 - 10:12.500) = Validation 2 [26_136_000:29_400_000]
+        # (10:12.500 - 10:14.000) = Silence
+        # (10:14.000)             = EOF @ 29_472_000
         #
-        # The stock NAM input file v3 (and NAM's training logic in general) assumes the following layout:
-        # Validation 1 | Blips | Training input (dry or wet) | Validation 2
-        #
-        # My Acid Test v2/v3 files have this layout:
-        # Blips | Training input (including Validation 1 in the middle) | Validation 2
-        #
-        # 5:29.000 to 6:49.500 = 15_792_000 : 19_656_000. The delta is 1:20:500, or 80.5 seconds, or 3_864_000 samples at 48_000 kHz.
+        # t_blips=96_000
+        # first_blips_start = 3_360_000
+        # t_validate=3_264_000,         # 01:08.000 = 68 * 48000 = 3_264_000
+        # train_start=3_456_000,        # 01:12.000 = 72 * 48000 = 3_456_000
+        # validation_start=-3_360_000,  # ((9 * 60) + 4.5) * 48000 = 26_136_000 absolute position.
+        # noise_interval=(3_372_000, 3_378_000), # silence for 125ms in length, 250ms before the first blip.
+        # blip_locations=((3_384_000, 3_432_000),), # Actual locations of each of the two blips.
         wet_audio_validation_segment_1 = wet_audio_tensor[: _V5_DATA_INFO.t_validate]
-        # ESR validation part 2 is from (_V5_DATA_INFO.t_validate samples before the end of the file) to the end of the file
-        # Extra 1.5 seconds after the second validation segment
-        end_offset = 1.5 * rate
-        # 7:52.000 to 9:12.500 = 22_656_000 : 26_520_000. The delta is 1:20:500, or 80.5 seconds, or 3_864_000 samples at 48_000 kHz.
-        wet_audio_validation_segment_2 = wet_audio_tensor[(dry_audio_tensor_len - (_V5_DATA_INFO.t_validate + end_offset)) : (dry_audio_tensor_len - end_offset)]
+
+        dry_audio_tensor_len = len(_wav_to_tensor(input_path))
+        print(f"Dry audio input Tensor length = {dry_audio_tensor_len}")
+        wet_audio_validation_segment_2 = wet_audio_tensor[(dry_audio_tensor_len + _V5_DATA_INFO.validation_start) : (dry_audio_tensor_len - (1.5 * rate))]
+        print("First wet audio segment = [96_000:3_360_000]")
+        print(f"Second wet audio segment = [{(dry_audio_tensor_len + _V5_DATA_INFO.validation_start)}:{(dry_audio_tensor_len - (1.5 * rate))}]")
         # Validation (replicate) ESR =
         #   * how much does wet_audio_validation_segment_1 differ from wet_audio_validation_segment_2?
         #   * does either segment drift off-grid from their expected positions relative to the start and end timings of the dry/wet audio files?
@@ -1004,55 +1030,6 @@ def get_wavenet_config(architecture):
         # channels  -> input_size
         #
         # head 3 -> channels 3 -> input 3
-        Architecture.ULTRA: {
-            "layers_configs": [
-                {
-                    "input_size": 1,
-                    "condition_size": 1,
-                    "channels": 32,
-                    "head_size": 8,
-                    "kernel_size": 3,
-                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
-                    "activation": "Tanh",
-                    "gated": False,
-                    "head_bias": False,
-                },
-                {
-                    "input_size": 32,
-                    "condition_size": 1,
-                    "channels": 8,
-                    "head_size": 8,
-                    "kernel_size": 3,
-                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
-                    "activation": "Tanh",
-                    "gated": False,
-                    "head_bias": False,
-                },
-                {
-                    "input_size": 8,
-                    "condition_size": 1,
-                    "channels": 8,
-                    "head_size": 8,
-                    "kernel_size": 3,
-                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
-                    "activation": "Tanh",
-                    "gated": False,
-                    "head_bias": False,
-                },
-                {
-                    "input_size": 8,
-                    "condition_size": 1,
-                    "channels": 8,
-                    "head_size": 1,
-                    "kernel_size": 3,
-                    "dilations": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
-                    "activation": "Tanh",
-                    "gated": False,
-                    "head_bias": True,
-                },
-            ],
-            "head_scale": 0.02,
-        },
         Architecture.COMPLEX: {
             "layers_configs": [
                 {
@@ -1365,10 +1342,6 @@ def get_wavenet_config(architecture):
     }[architecture]
 
 
-_CAB_MRSTFT_PRE_EMPH_WEIGHT = 2.0e-4
-_CAB_MRSTFT_PRE_EMPH_COEF = 0.85
-
-
 def _get_data_config(
     input_version: _Version,
     input_path: _Path,
@@ -1416,17 +1389,18 @@ def _get_data_config(
         elif data_info.major_version == 5:
             validation_start = data_info.validation_start
             train_stop = validation_start
-            # Hard-coding 7:52.000, or 22_656_000 samples, because I realized too late how the dataset is created by splitting up the audio file(s).
+            # validation_start=-3_360_000,  # -01:09.500 = 1:08.000 + 1.5 seconds trailing silence.
+            # ((9 * 60) + 4.5) * 48000 = 26_136_000 absolute position.
+            # (29_472_000 - (((9 * 60) + 4.5) * 48000)) / 48000 = 69.5
             #
-            # The stock NAM input file v3 (and NAM's training logic in general) assumes the following layout:
-            # Validation 1 | Blips | Training input (dry or wet) | Validation 2
+            # train_start=3_456_000,        # 01:12.000 = 72 * 48000 = 3_456_000
             #
-            # My Acid Test v2/v3 files have this layout:
-            # Blips | Training input (including Validation 1 in the middle) | Validation 2
-            train_kwargs = {"start_samples": data_info.train_start, "stop_samples": 22_656_000}
-            # 5:29.000 to 6:49.500 = 15_792_000 : 19_656_000. The delta is 1:20:500, or 80.5 seconds, or 3_864_000 samples at 48_000 kHz.
-            # 7:52.000 to 9:12.500 = 22_656_000 : 26_520_000. The delta is 1:20:500, or 80.5 seconds, or 3_864_000 samples at 48_000 kHz.
-            validation_kwargs = {"start_samples": 22_656_000}
+            # Minutes:Seconds.Samples
+            # (01:12.000 - 09:04.000) = Training data (Technically the final sine sweep ends at 09:04.000) [3_456_000:26_112_000]
+            # (09:04.000 - 09:04:500) = Silence between sine sweep audio end and Validation 2 audio start
+            # (09:04.500 - 10:12.500) = Validation 2 [26_136_000:29_400_000]
+            train_kwargs = {"start_samples": data_info.train_start, "stop_samples": 26_136_000}
+            validation_kwargs = {"start_samples": data_info.validation_start}
         else:
             raise NotImplementedError(f"kwargs for input version {input_version}")
         return train_kwargs, validation_kwargs
@@ -1488,8 +1462,13 @@ def _get_configs(
             "loss": {"val_loss": "esr"},
             "optimizer": {"lr": lr},
             "lr_scheduler": {
-                "class": "ExponentialLR",
-                "kwargs": {"gamma": 1.0 - lr_decay},
+                'class': 'ReduceLROnPlateau',
+                    'kwargs': {
+                        'mode': 'min',
+                        'factor': lr_decay,
+                        'patience': 5
+                    },
+                'monitor': 'ESRPREEMPH'
             },
         }
     else:
@@ -1520,13 +1499,14 @@ def _get_configs(
         print("WARNING: No GPU was found. Training will be very slow!")
         device_config = {}
     # LEARNING CONFIG
+    # Set `num_workers` to the same number of P-cores in your computer.
     learning_config = {
         "train_dataloader": {
             "batch_size": batch_size,
             "shuffle": True,
             "pin_memory": True,
             "drop_last": True,
-            "num_workers": 8,
+            "num_workers": 6,
             "persistent_workers": True
         },
         "val_dataloader": {},
@@ -1545,17 +1525,12 @@ def _get_dataloaders(
     dataset_train = _init_dataset(data_config, _Split.TRAIN)
     dataset_validation = _init_dataset(data_config, _Split.VALIDATION)
     train_dataloader = _DataLoader(dataset_train, **learning_config["train_dataloader"])
-    val_dataloader = _DataLoader(
-        dataset_validation, **learning_config["val_dataloader"]
-    )
+    val_dataloader = _DataLoader(dataset_validation, **learning_config["val_dataloader"])
     return train_dataloader, val_dataloader
 
 
 def _esr(pred: _torch.Tensor, target: _torch.Tensor) -> float:
-    return (
-        _torch.mean(_torch.square(pred - target)).item()
-        / _torch.mean(_torch.square(target)).item()
-    )
+    return (_torch.mean(_torch.square(pred - target)).item() / _torch.mean(_torch.square(target)).item())
 
 
 def _plot(
@@ -1566,17 +1541,19 @@ def _plot(
     filepath: _Optional[str] = None,
     silent: bool = False,
 ) -> float:
-    """
-    :return: The ESR
-    """
+    """:return: The ESR"""
+
     print("Plotting a comparison of your model with the target output...")
     with _torch.no_grad():
-        tx = len(ds.x) / 48_000
-        print(f"Run (t={tx:.2f} sec)")
+        print(f"Dataset x size in samples = {len(ds.x)}")
+        print(f"Dataset y size in samples = {len(ds.y)}")
+        dataset_x_size_in_seconds = len(ds.x) / 48_000
+        print(f"Dataset x size in seconds = {dataset_x_size_in_seconds:.2f}")
         t0 = _time()
         output = model(ds.x).flatten().cpu().numpy()
+        print(f"len(model(ds.x).flatten().cpu().numpy()) = {len(output)}")
         t1 = _time()
-        print(f"Took {t1 - t0:.2f} sec ({tx / (t1 - t0):.2f}x)")
+        print(f"Took {t1 - t0:.2f} sec ({dataset_x_size_in_seconds / (t1 - t0):.2f}x)")
 
     esr = _esr(_torch.Tensor(output), ds.y)
     # Trying my best to put numbers to it...
@@ -1595,12 +1572,26 @@ def _plot(
     print(f"Error-signal ratio = {esr:.4g}")
     print(esr_comment)
 
-    _plt.figure(figsize=(16, 5))
-    _plt.plot(output[window_start:window_end], label="Prediction")
-    _plt.plot(ds.y[window_start:window_end], linestyle="--", label="Target")
+    # figsize in inches * dpi default of 100
+    #   (16, 5)      = 1600 x 500 pixels
+    #   (19.2, 10.8) = 1920 x 1080 pixels
+    #   (9.6, 5.4)   = 960 x 540 pixels
+    _plt.figure(figsize=(9.6, 5.4), edgecolor='black')
+    _plt.plot(output[window_start:window_end], color='xkcd:orange', linestyle='--', label='Prediction')
+    _plt.plot(ds.y[window_start:window_end], color='xkcd:blue', linestyle='solid', label='Target')
     _plt.title(f"ESR={esr:.4g}")
-    _plt.legend()
+    _plt.xlabel('Time in samples')
+    _plt.ylabel('Amplitude normalized to range [1, -1]')
+    _plt.legend(fancybox=True, shadow=True)
+    _plt.grid()
     if filepath is not None:
+        # E.g.:
+        #   ./RLROP_ESRPREEMPH/2026_Feb_21_NAM_120_AcidInput_v4_JRAT_nam_48kHz_24int_mono_1773770799.png
+        # Where ./RLROP_ESRPREEMPH is the trainer default output path
+        # and 2026_Feb_21_NAM_120_AcidInput_v4_JRAT_nam_48kHz_24int_mono is the model name
+        # and 2026_Feb_21_NAM_120_AcidInput_v4_JRAT_nam_48kHz_24int_mono_1773770799 is the checkpoint basename
+        # defined in:
+        #   def _save_checkpoint(self, trainer: _pl.Trainer, filepath: str):
         _plt.savefig(f"{filepath}_{int(time.time())}.png")
     if not silent:
         _plt.show()
@@ -1608,9 +1599,6 @@ def _plot(
 
 
 def _print_nasty_checks_warning():
-    """
-    "ffs" -Dom
-    """
     print(
         "\n"
         "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\n"
@@ -1729,13 +1717,15 @@ class _ModelCheckpoint(_pl.callbacks.model_checkpoint.ModelCheckpoint):
 
 def get_callbacks(
     threshold_esr: _Optional[float],
+    dirpath: _Optional[str],
     user_metadata: _Optional[_UserMetadata] = None,
     settings_metadata: _Optional[_metadata.Settings] = None,
     data_metadata: _Optional[_metadata.Data] = None,
 ):
     callbacks = [
         _ModelCheckpoint(
-            filename="checkpoint_best_{epoch:04d}_{step}_{ESR:.4g}_{MSE:.3e}",
+            dirpath=dirpath,
+            filename="checkpoint_best_{epoch:04d}_{step}_{ESR:.4g}_{ESRPREEMPH:.4g}_{MSE:.3e}",
             save_top_k=3,
             monitor="val_loss",
             every_n_epochs=1,
@@ -1744,6 +1734,7 @@ def get_callbacks(
             data_metadata=data_metadata,
         ),
         _ModelCheckpoint(
+            dirpath=dirpath,
             filename="checkpoint_last_{epoch:04d}_{step}",
             every_n_epochs=1,
             user_metadata=user_metadata,
@@ -1764,16 +1755,12 @@ class TrainOutput(_NamedTuple):
     :param simplified_trainer_metadata: The metadata summarizing training with the
         simplified trainer.
     """
-
     model: _Optional[_LightningModule]
     metadata: _metadata.TrainingMetadata
 
 
 class _FinalLatencyError(ValueError):
-    """
-    Raised when the final latency cannot be determined.
-    """
-
+    """Raised when the final latency cannot be determined."""
     pass
 
 
@@ -1814,10 +1801,11 @@ def train(
     input_path: str,
     output_path: str,
     train_path: str,
-    epochs=1000,
+    epochs=300,
     latency: _Optional[int] = None,
     model_type: str = "WaveNet",
     architecture: _Union[Architecture, str] = Architecture.STANDARD,
+    precision: str = '32-true',
     batch_size: int = 16,
     ny: int = _NY_DEFAULT,
     lr=0.002,
@@ -1866,14 +1854,11 @@ def train(
     input_version, strong_match = _detect_input_version(input_path)
 
     user_latency = latency
-    latency_analysis = _analyze_latency(
-        user_latency, input_version, input_path, output_path, silent=silent
-    )
+    latency_analysis = _analyze_latency(user_latency, input_version, input_path, output_path, silent=silent)
     final_latency = _get_final_latency(latency_analysis)
 
-    data_check_output = _check_data(
-        input_path, output_path, input_version, final_latency, silent
-    )
+    data_check_output = _check_data(input_path, output_path, input_version, final_latency, silent)
+
     if data_check_output is not None:
         if data_check_output.passed:
             print("-Checks passed")
@@ -1916,9 +1901,8 @@ def train(
         batch_size,
         fit_mrstft,
     )
-    assert (
-        "fast_dev_run" not in learning_config
-    ), "fast_dev_run is set as a kwarg to train()"
+    
+    assert ("fast_dev_run" not in learning_config), "fast_dev_run is set as a kwarg to train()"
 
     print("Starting training. It's time to kick ass and chew bubblegum!")
     # Issue:
@@ -1927,9 +1911,7 @@ def train(
     # (Hacky) solution: set sample rate in model from dataloader after second
     # instantiation from final checkpoint.
     model = _LightningModule.init_from_config(model_config)
-    train_dataloader, val_dataloader = _get_dataloaders(
-        data_config, learning_config, model
-    )
+    train_dataloader, val_dataloader = _get_dataloaders(data_config, learning_config, model)
     if train_dataloader.dataset.sample_rate != val_dataloader.dataset.sample_rate:
         raise RuntimeError(
             "Train and validation data loaders have different data set sample rates: "
@@ -1946,13 +1928,14 @@ def train(
     # /save_dir/name/version/sub_dir/
     # if sub_dir is None:
     #     /save_dir/name/version/
-    str_batch_size = str(batch_size)
-    str_lr = str(lr)
-    str_lr_decay = str(lr_decay)
+    save_dir = _Path(train_path).joinpath(modelname)
     str_epochs = str(epochs)
-    str_hparams = f"batch{str_batch_size}_lr{str_lr}_lrdecay{str_lr_decay}"
+    str_hparams = f"{precision}_ny{str(ny)}_batch{str(batch_size)}_lr{str(lr)}_lrdecay{str(lr_decay)}"
     str_architecture = architecture.value
-    logger = TensorBoardLogger(save_dir=modelname, name=str_architecture, version=str_epochs, sub_dir=str_hparams)
+    logger = TensorBoardLogger(save_dir=save_dir, name=str_architecture, version=str_epochs, sub_dir=str_hparams)
+
+    # Save checkpoints here:
+    dirpath = _Path(logger.log_dir).joinpath('checkpoints')
 
     trainer = _pl.Trainer(
         callbacks=get_callbacks(
@@ -1960,14 +1943,53 @@ def train(
             user_metadata=user_metadata,
             settings_metadata=settings_metadata,
             data_metadata=data_metadata,
+            dirpath=dirpath,
         ),
         default_root_dir=train_path,
         fast_dev_run=fast_dev_run,
         logger=logger,
-        # TODO: experiment
-        #precision='bf16-mixed',
+        precision=precision,
+        # https://lightning.ai/docs/pytorch/stable/common/trainer.html#benchmark
+        benchmark=True,
         **learning_config["trainer"],
     )
+    # Suppress the PossibleUserWarning about num_workers (Issue 345)
+    with _filter_warnings("ignore", category=_PossibleUserWarning):
+        # THIS IS WHERE TRAINING ACTUALLY OCCURS!
+        trainer.fit(model, train_dataloader, val_dataloader)
+
+    # Go to best checkpoint
+    best_checkpoint = trainer.checkpoint_callback.best_model_path
+    if best_checkpoint != "":
+        model = _LightningModule.load_from_checkpoint(
+            trainer.checkpoint_callback.best_model_path,
+            **_LightningModule.parse_config(model_config),
+        )
+    model.cpu()
+    model.eval()
+    model.net.sample_rate = sample_rate  # Hack, part 2
+
+    def window_kwargs(version: _Version):
+        if version.major == 1:
+            return dict(
+                window_start=100_000,  # Start of the plotting window, in samples
+                window_end=101_000,  # End of the plotting window, in samples
+            )
+        elif version.major == 2:
+            # Same validation set even though it's a different spot in the reamp file
+            return dict(
+                window_start=100_000,  # Start of the plotting window, in samples
+                window_end=101_000,  # End of the plotting window, in samples
+            )
+        elif version.major == 5:
+            return dict(
+                window_start=96_000,  # Start of the plotting window, in samples
+                window_end=120_000,  # End of the plotting window, in samples
+            )# Fallback:
+        return dict(
+            window_start=100_000,  # Start of the plotting window, in samples
+            window_end=101_000,  # End of the plotting window, in samples
+        )
 
     try:
         # Suppress the PossibleUserWarning about num_workers (Issue 345)
@@ -1988,34 +2010,18 @@ def train(
         model.eval()
         model.net.sample_rate = sample_rate  # Hack, part 2
 
-        def window_kwargs(version: _Version):
-            if version.major == 1:
-                return dict(
-                    window_start=100_000,  # Start of the plotting window, in samples
-                    window_end=101_000,  # End of the plotting window, in samples
-                )
-            elif version.major == 2:
-                # Same validation set even though it's a different spot in the reamp file
-                return dict(
-                    window_start=100_000,  # Start of the plotting window, in samples
-                    window_end=101_000,  # End of the plotting window, in samples
-                )
-            # Fallback:
-            return dict(
-                window_start=100_000,  # Start of the plotting window, in samples
-                window_end=101_000,  # End of the plotting window, in samples
-            )
-
         validation_esr = _plot(
             model,
             val_dataloader.dataset,
-            filepath=train_path + "/" + modelname if save_plot else None,
+            filepath=train_path + "/" + f"{modelname}_{str_architecture}_{str_epochs}_{str_hparams}" if save_plot else None,
             silent=silent,
             **window_kwargs(input_version),
         )
+
         for dl in (train_dataloader, val_dataloader):
             assert isinstance(dl.dataset, _AbstractDataset)
             dl.dataset.teardown()
+
         return TrainOutput(
             model=model,
             metadata=_metadata.TrainingMetadata(
@@ -2031,9 +2037,7 @@ class DataInputValidation(_BaseModel):
 
 
 def validate_input(input_path) -> DataInputValidation:
-    """
-    :return: Could it be validated?
-    """
+    """:return: Could it be validated?"""
     try:
         _detect_input_version(input_path)
         # succeeded...
@@ -2044,10 +2048,7 @@ def validate_input(input_path) -> DataInputValidation:
 
 
 class _PyTorchDataSplitValidation(_BaseModel):
-    """
-    :param msg: On exception, catch and assign. Otherwise None
-    """
-
+    """:param msg: On exception, catch and assign. Otherwise None"""
     passed: bool
     msg: _Optional[str]
 

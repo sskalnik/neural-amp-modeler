@@ -120,7 +120,10 @@ def wav_to_np(
             assert required_bit_depth is None
             assert required_samplerate is None
             file_to_match = SoundFile(str(require_match))
-            required_shape = file_to_match.channels
+            # A two-dimensional NumPy (frames x channels) array is returned.
+            # If the SoundFile has only one channel, a one-dimensional array is returned.
+            # Use `always_2d=True` to return a two-dimensional array anyway.
+            required_shape = file_to_match.shape
             # >>> input_wav_file.extra_info
             #   "File : 'Acid Input v1.aif' (utf-8 converted from ucs-2)\nLength : 154944092\n
             #   FORM : 154944084\n AIFC\n  FVER : 4\n COMM : 44\n  Sample Rate : 48000\n
@@ -136,7 +139,7 @@ def wav_to_np(
             #   'FLOAT'
             # >>> input_wav_file.subtype_info
             #   '32 bit float'
-            required_bit_depth = file_to_match.subtype_info
+            required_bit_depth = file_to_match.subtype
             required_samplerate = file_to_match.samplerate
         if required_samplerate is not None:
             if dry_input_file.samplerate != required_samplerate:
@@ -160,7 +163,7 @@ def wav_to_np(
                     f"{arr_premono.shape}!",
                 )
         arr = arr_premono[:, 0]
-        return arr if not info else (arr, (dry_input_file.samplerate, dry_input_file.subtype_info))
+        return arr if not info else (arr, (dry_input_file.samplerate, dry_input_file.subtype))
 
     # I'm leaving the `librosa` fallback as-is for now.
     # TODO: Refactor this to not rely on `wavio`, and use `soundfile` instead.
@@ -178,7 +181,7 @@ def wav_to_np(
         sample_rate = int(float_sample_rate)
         if _np.abs(sample_rate - float_sample_rate) > 0.0001:
             raise RuntimeError(
-                f"Encountered unsupportednon-integer sample rate {float_sample_rate} in file {filename}!"
+                f"Encountered unsupported non-integer sample rate {float_sample_rate} in file {filename}!"
             )
         # Librosa returns a 1-dimensional array if mono. instead of (N,1)
         x_sampwidth = None
@@ -247,6 +250,13 @@ def wav_to_tensor(
     np_array_and_maybe_samplerate_and_bit_depth = wav_to_np(*args, info=info, **kwargs)
     if info:
         numpy_array, info = np_array_and_maybe_samplerate_and_bit_depth
+        # NOTE:
+        # A two-dimensional NumPy (frames x channels) array is returned.
+        # If the SoundFile has only one channel, a one-dimensional array is returned.
+        # Use `always_2d=True` to return a two-dimensional array anyway.
+
+        # E.g.:
+        # _torch.Tensor(numpy_array), 'FLOAT'
         return _torch.Tensor(numpy_array), info
     else:
         numpy_array = np_array_and_maybe_samplerate_and_bit_depth
@@ -267,7 +277,7 @@ def np_to_wav(
     numpy_array: _np.ndarray,
     filename: _Union[str, _Path],
     samplerate: int = 48_000,
-    bit_depth: str = '32 bit float',
+    bit_depth: str = 'FLOAT',
     **kwargs,
 ):
     """See `soundfile.available_formats()` and `soundfile.available_subtypes()` for options."""
@@ -283,7 +293,7 @@ def np_to_wav(
     # TODO: Consider whether or not this introduces unwanted digital hard clipping.
     print(f"""
           Exporting {str(filename)} with {_REQUIRED_CHANNELS} channels,
-          {samplerate} sample rate, and {bit_depth} bit depth...
+          {samplerate} sample rate, and {bit_depth} bit depth...)
           """
     # 'w' for writing (truncates file) or 'x' for writing (raises an error if file already exists).
     #
@@ -297,6 +307,13 @@ def np_to_wav(
     #   'PCM_32': 'Signed 32 bit PCM',
     #   ...}
     with SoundFile(str(filename), 'x', samplerate, _REQUIRED_CHANNELS, bit_depth, 'FLOAT') as f:
+        # Any value in the Numpy Array with a value outside of the range [-1, 1] is set to -1 or 1, respectively
+        # NOTE: https://janhendrikewers.uk/exploring_faster_np_clip
+        #   `np.core.umath.maximum(np.core.umath.minimum(X, VMAX), VMIN)` is roughly 4x faster than `np.clip`.
+        # TODO: Would it be better to normalize instead of clip?
+        # https://stackoverflow.com/questions/1735025/how-to-normalize-a-numpy-array-to-within-a-certain-range
+        #   peak_value = np.max(np.abs((numpy_array))
+        #   normalized_to_0dBFS_peak = numpy_array *= (1 / peak_value)
         f.write(_np.clip(numpy_array, a_min=-1.0, a_max=1.0))
 
 
@@ -395,13 +412,27 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         y_path: _Optional[_Union[str, _Path]] = None,
         input_gain: float = 0.0,
         sample_rate: _Optional[float] = None,
-        require_input_pre_silence: _Optional[
-            float
-        ] = _DEFAULT_REQUIRE_INPUT_PRE_SILENCE,
+        require_input_pre_silence: _Optional[float] = _DEFAULT_REQUIRE_INPUT_PRE_SILENCE,
     ):
         """
-        :param dry_audio_tensor: 'x' The input signal. A 1D array.
-        :param wet_audio_tensor: 'y' The associated output from the model. A 1D array.
+        :param dry_audio_tensor: 'x' The input signal.
+            But also sometimes the 'wet' audio file converted to a Tensor (???)
+            When used to load input/output (wet/dry) audio file pairs for training:
+                x = input.WAV
+                y = output_from_my_tube_amp.WAV
+            When used to load predictions from the model and targets from the validation dataset:
+                x = validation dataset
+                y = model's predictions
+            A 1D array.
+        :param wet_audio_tensor: 'y' The associated output from the model.
+            But also sometimes the 'wet' audio file converted to a Tensor (???)
+            When used to load input/output (wet/dry) audio file pairs for training:
+                x = input.WAV
+                y = output_from_my_tube_amp.WAV
+            When used to load predictions from the model and targets from the validation dataset:
+                x = validation dataset
+                y = model's predictions
+            A 1D array.
         :param nx: The number of samples required as input for the model. For example,
             for a ConvNet, this would be the receptive field.
         :param ny: How many samples to provide as the output array for a single "datum".
@@ -474,10 +505,32 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         # If the two files are, for example, both 48000 samples long:
         #   If nx = 4096 and ny = None:
         #     ny = 48000 - 4096 + 1
+        #
+        # If the model's receptive field is 4096 and `NY` is set by the training script/GUI:
+        #   nx = 4096
+        #   ny = 8192
+        #     Ergo ny = 8192
         self._ny = ny if ny is not None else len(dry_audio_tensor) - nx + 1
 
     def __getitem__(self, idx: int) -> _Tuple[_torch.Tensor, _torch.Tensor]:
         """
+        Return two Tensors containing data to be used for training or compared for loss or plotting, etc.
+
+        dry_audio_tensor: 'x' The input signal.
+            But also sometimes the 'wet' audio file converted to a Tensor (???)
+            A 1D array.
+
+        wet_audio_tensor: 'y' The associated output from the model.
+            But also sometimes the 'wet' audio file converted to a Tensor (???)
+            A 1D array.
+
+        When used to load input/output (wet/dry) audio file pairs for training:
+            x = input.WAV
+            y = output_from_my_tube_amp.WAV
+        When used to load predictions from the model and targets from the validation dataset:
+            x = validation dataset
+            y = model's predictions
+
         :return:
             Input (NX + NY - 1,)
             Output (NY,)
@@ -485,8 +538,12 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         if idx >= len(self):
             raise IndexError(f"Attempted to access datum {idx}, but len is {len(self)}")
         # TODO: Replace all of these obtuse and overly terse variable names with more descriptive names.
+        # i = Dataset item index * number of samples `ny`
         i = idx * self._ny
+        # j = i + (self._nx - 1)
         j = i + self.y_offset
+        # [0] = self.x[(Dataset item index * number of samples `ny`) : ((Dataset item index * number of samples `ny`) + (self._ny - 1))]
+        # [1] = self.y[((Dataset item index * number of samples `ny`) + (self._nx - 1)) : (((Dataset item index * number of samples `ny`) + (self._nx - 1)) + self._ny)]
         return self.x[i : i + self._nx + self._ny - 1], self.y[j : j + self._ny]
 
     def __len__(self) -> int:
@@ -757,7 +814,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         if ny is not None:
             assert ny <= len(wet_audio_tensor) - nx + 1
         if _torch.abs(wet_audio_tensor).max() >= 1.0:
-            msg = "Output clipped! _torch.abs(wet_audio_tensor).max() >= 1.0"
+            msg = "Wet audio Tensor (or output from the model, whatever `y` is) is clipping! _torch.abs(wet_audio_tensor).max() >= 1.0 "
             if self._y_path is not None:
                 msg += f"Source is {self._y_path}"
             raise ValueError(msg)
@@ -765,7 +822,7 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
     @classmethod
     def _validate_preceding_silence(
         cls,
-        dry_audio_tensor: _torch.Tensor,
+        audio_tensor: _torch.Tensor,
         start: _Optional[int],
         silent_seconds: float,
         sample_rate: _Optional[float],
@@ -779,8 +836,8 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
 
         See: Issue #252
 
-        :param x: Input
-        :param start: Where the data starts
+        :param audio_tensor: Input `_torch.Tensor`
+        :param start: Starting index (where the data starts)
         :param silent_samples: How many are expected to be silent
         """
         if sample_rate is None:
@@ -796,8 +853,8 @@ class Dataset(AbstractDataset, _InitializableFromConfig):
         check_end = start
         if not _torch.all(dry_audio_tensor[check_start:check_end] == 0.0):
             raise XYError(
-                f"Input provided isn't silent for at least {silent_samples} samples "
-                "before the starting index. Responses to this non-silent input may "
+                f"Input audio Tensor isn't silent for at least {silent_samples} samples "
+                f"before the starting index of {start}. Responses to this non-silent input may "
                 "leak into the dataset!"
             )
 

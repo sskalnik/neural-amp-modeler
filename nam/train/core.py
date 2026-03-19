@@ -51,6 +51,7 @@ from ._version import PROTEUS_VERSION as _PROTEUS_VERSION, Version as _Version
 from .lightning_module import LightningModule as _LightningModule
 from . import metadata as _metadata
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.pytorch.callbacks import DeviceStatsMonitor
 
 
 # Force both matrix operations and convolutions to use full 32-bit float Tensor Cores:
@@ -1741,6 +1742,7 @@ def get_callbacks(
             settings_metadata=settings_metadata,
             data_metadata=data_metadata,
         ),
+        DeviceStatsMonitor(cpu_stats=True),
     ]
     if threshold_esr is not None:
         callbacks.append(
@@ -1951,6 +1953,10 @@ def train(
         precision=precision,
         # https://lightning.ai/docs/pytorch/stable/common/trainer.html#benchmark
         benchmark=True,
+        # Enable this for debugging and optimization experiments:
+        # https://lightning.ai/docs/pytorch/stable/tuning/profiler_basic.html
+        # Also consider: https://lightning.ai/docs/pytorch/stable/api_references.html#profiler
+        #profiler="advanced",
         **learning_config["trainer"],
     )
     # Suppress the PossibleUserWarning about num_workers (Issue 345)

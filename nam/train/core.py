@@ -11,6 +11,7 @@ Used by the GUI and Colab trainers.
 import hashlib as _hashlib
 import time
 import tkinter as _tk
+
 from copy import deepcopy as _deepcopy
 from enum import Enum as _Enum
 from functools import partial as _partial
@@ -29,10 +30,15 @@ import matplotlib.pyplot as _plt
 import numpy as _np
 import pytorch_lightning as _pl
 import torch as _torch
+
 from pydantic import BaseModel as _BaseModel
-from pytorch_lightning.utilities.warnings import (
-    PossibleUserWarning as _PossibleUserWarning,
-)
+from pytorch_lightning.utilities.warnings import PossibleUserWarning as _PossibleUserWarning
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import DeviceStatsMonitor
+from pytorch_lightning.callbacks import EarlyStopping
+from pytorch_lightning.callbacks import RichModelSummary
+from pytorch_lightning.callbacks import RichProgressBar
+from pytorch_lightning.callbacks import Timer
 from torch.utils.data import DataLoader as _DataLoader
 
 from ..data import (
@@ -50,14 +56,30 @@ from ..util import filter_warnings as _filter_warnings
 from ._version import PROTEUS_VERSION as _PROTEUS_VERSION, Version as _Version
 from .lightning_module import LightningModule as _LightningModule
 from . import metadata as _metadata
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.pytorch.callbacks import DeviceStatsMonitor
 
 
 # Force both matrix operations and convolutions to use full 32-bit float Tensor Cores:
 # https://docs.pytorch.org/docs/stable/notes/numerical_accuracy.html#tensorfloat-32-tf32-on-nvidia-ampere-and-later-devices
 _torch.backends.cudnn.conv.fp32_precision = "ieee"
 
+# NOTE: Additional callbacks are defined here:
+# Stop if validation loss does not decrease by at least `min_delta` within `patience` epochs.
+# Also, stop if the validation loss is `NaN` or infinite (this usually indicates an error due to a nonsensical value).
+early_stopping = EarlyStopping(
+    monitor='val_loss',
+    mode='min',
+    min_delta=0.00001,
+    patience=20,
+    check_finite=True,
+    verbose=True,
+)
+# NOTE: This maxes out the depth, so it could be excessively verbose...
+rich_model_summary = RichModelSummary(max_depth=-1)
+# NOTE: `cpu_stats` really means CPU, GPU, and some other stuff:
+# https://lightning.ai/docs/pytorch/stable/api/lightning.pytorch.callbacks.DeviceStatsMonitor.html
+device_stats_monitor = DeviceStatsMonitor(cpu_stats=True)
+# NOTE: This logs time per training, validation, and test loops to the trainer's callback dictionary.
+time_stats_monitor = Timer(duration=None, verbose=True)
 
 # Training using the simplified trainers in NAM is done at 48k.
 STANDARD_SAMPLE_RATE = 48_000.0
@@ -93,6 +115,8 @@ _DELAY_CALIBRATION_REL_THRESHOLD = 0.001
 _DELAY_CALIBRATION_SAFETY_FACTOR = 0
 
 
+#TODO: Refactor all of these hard-coded values to simple JSON and/or YAML config files.
+#TODO: Refactor all of the *data* into simple JSON and/or YAML config files, so it's separate from the *code*.
 class Architecture(_Enum):
     COMPLEX = "complex"
     REVYHI = "revyhi"
@@ -430,9 +454,19 @@ _V4_DATA_INFO = _DataInfo(
     blip_locations=((22_050,),),
 )
 
+# FIXME: Seriously, you can see how unnecessarily complicated this is.
+#   What makes a lot more sense (SP = silence padding):
+#       | SP | Validation 1 | SP Blips SP | Training data | SP | Validation 2 | SP |
+#       | 0  | v1_start     | blips_start | train_start   |    | v1_start     | -1 |
+#   If SP is the same length in all instances, then you can just make all splits be:
+#       silence_padded_start_of_each_section = absolute_start_of_each section - (1/2 * len(SP))
+#       silence_padded_end_of_each_section = absolute_end_of_each section + (1/2 * len(SP))
+#
+# TODO: Create user-friendly documentation for how everything works.
+# TODO: Refactor all of this convoluted logic to be more obvious and conceptually simpler.
 # V5 = S3 Sound's "acid test". This is meant for TB-303-style acid synths, not guitars!
 #
-# ESR will be plotted from 96_000 to 108_000.
+# ESR will be plotted from 96_000 to 120_000.
 # 120 BPM = 2 seconds per bar = 500 ms per 1/4 note = 125 ms per 1/16 note.
 # 1/4 = 24_000, 1/8 = 12_000, 1/16 = 6_000 samples @ 48_000 Hz sample rate.
 #
@@ -460,11 +494,6 @@ _V5_DATA_INFO = _DataInfo(
     noise_interval=(3_372_000, 3_378_000), # silence for 125ms in length, 250ms before the first blip, establishing the wet "output" file's noise floor.
     blip_locations=((3_384_000, 3_432_000),), # Actual locations of each of the two blips
 )
-# FYI, from _get_data_config:
-# validation_start = data_info.validation_start
-# train_stop = validation_start
-# train_kwargs = {"start_samples": data_info.train_start, "stop_samples": train_stop}
-# validation_kwargs = {"start_samples": validation_start}
 
 
 def _warn_lookaheads(indices: _Sequence[int]) -> str:
@@ -554,16 +583,18 @@ def _calibrate_latency_v_all(
     )
     print(f"Trigger threshold is {trigger_threshold}")
 
-    y_scans = []
-    for blip_index, i_abs in enumerate(data_info.blip_locations[0], 1):
+    blip_search_ranges = []
+    for blip_index, blip_location in enumerate(data_info.blip_locations[0], 1):
         # Relative to start of the data
-        i_rel = i_abs - data_info.first_blips_start
+        i_rel = blip_location - data_info.first_blips_start
+        print(f"Blip {blip_index} expected to be at {i_rel} relative to data_info.first_blips_start value of {data_info.first_blips_start}")
         # Start at 1_000 samples before the blip location
         start_looking = i_rel - lookahead
         # Stop at 10_000 samples after the blip location
         stop_looking = i_rel + lookback
-        y_scans.append(y[start_looking:stop_looking])
-    y_scan_average = _np.mean(_np.stack(y_scans), axis=0)
+        print(f"Scanning for blip {blip_index} between {start_looking} and {stop_looking}")
+        blip_search_ranges.append(y[start_looking:stop_looking])
+    y_scan_average = _np.mean(_np.stack(blip_search_ranges), axis=0)
     triggered = _np.where(_np.abs(y_scan_average) > trigger_threshold)[0]
     if len(triggered) == 0:  # No impulse responses were detected; can't calibrate
         msg = (
@@ -581,9 +612,9 @@ def _calibrate_latency_v_all(
                 color="C0",
                 label="Signal average",
             )
-            for y_scan in y_scans:
+            for blip_search_range in blip_search_ranges:
                 _plt.plot(
-                    _np.arange(-lookahead, lookback), y_scan, color="C0", alpha=0.2
+                    _np.arange(-lookahead, lookback), blip_search_range, color="C0", alpha=0.2
                 )
             _plt.axvline(x=0, color="C1", linestyle="--", label="Trigger")
             _plt.axhline(
@@ -598,16 +629,13 @@ def _calibrate_latency_v_all(
             _plt.show()
         delays = []
         recommended = None
-
     else:
         delay = triggered[0] + start_looking - i_rel
         delays = [delay]
         recommended = delay - safety_factor
-        print(f"Delay based on average is {delay}")
-        print(
-            f"After aplying safety factor of {safety_factor}, the final delay is "
-            f"{recommended}"
-        )
+        print(f"Delay based on average _np.mean(_np.stack(blip_search_ranges), axis=0)` is {delay}")
+        print(f"Delay is based on triggered[0] {triggered[0]} + start_looking {start_looking} - relative index = {i_rel}")
+        print(f"After applying safety factor of {safety_factor}, the final delay is {recommended} samples")
 
     warnings = report_any_latency_warnings(delays)
 
@@ -630,17 +658,19 @@ _calibrate_latency_v5 = _partial(_calibrate_latency_v_all, _V5_DATA_INFO)
 def _plot_latency_v_all(
     data_info: _DataInfo, latency: int, input_path: str, output_path: str, _nofail=True
 ):
-    print("Plotting the latency for manual inspection...")
+    print("\nPlotting the latency for manual inspection...")
+    print(f"data_info.major_version == {data_info.major_version}")
+    print(f"Truncating x and y to range [{data_info.first_blips_start}:{data_info.first_blips_start + data_info.t_blips}]")
     x = _wav_to_np(input_path)[data_info.first_blips_start : data_info.first_blips_start + data_info.t_blips]
     y = _wav_to_np(output_path)[data_info.first_blips_start : data_info.first_blips_start + data_info.t_blips]
+    print(f"len(x) = {len(x)} loaded from {input_path}")
+    print(f"len(y) = {len(y)} loaded from {output_path}")
     # Only get the blips we really want.
-    i = _np.where(_np.abs(x) > 0.5 * _np.abs(x).max())[0]
-    if len(i) == 0:
-        print("Failed to find the spike in the input file.")
-        print(
-            "Plotting the input and output; there should be spikes at around the "
-            "marked locations."
-        )
+    detected_blip_locations = _np.where(_np.abs(x) > 0.5 * _np.abs(x).max())[0]
+    print(f"detected_blip_locations = {detected_blip_locations}")
+    if len(detected_blip_locations) == 0:
+        print(f"Failed to find any blips in {input_path}")
+        print("Plotting the input and output; there should be spikes at around the marked locations.")
         t = _np.arange(data_info.first_blips_start, data_info.first_blips_start + data_info.t_blips)
         expected_spikes = data_info.blip_locations[0]  # For v1 specifically
         fig, axs = _plt.subplots(len((x, y)), 1)
@@ -651,20 +681,50 @@ def _plot_latency_v_all(
         if _nofail:
             raise RuntimeError("Failed to plot delay")
     else:
-        _plt.figure()
-        di = 20
+        _plt.figure(figsize=(10.8, 7.2), edgecolor='black')
+        plot_range_in_samples = 32
         # V1's got not a spike but a longer plateau; take the front of it.
         if data_info.major_version == 1:
-            i = [i[0]]
-        for e, ii in enumerate(i, 1):
+            detected_blip_locations = [detected_blip_locations[0]]
+        # figsize in inches * dpi default of 100
+        #   (16, 5)      = 1600 x 500 pixels
+        #   (19.2, 10.8) = 1920 x 1080 pixels
+        #   (9.6, 5.4)   = 960 x 540 pixels
+        #   10.8, 7.2)   = 1080 x 720 pixels
+        # (0, (1, 1))) = "densely dotted line/curve"
+        #NOTE: Enable this if you need to debug.
+        #print(f"_np.arange(-plot_range_in_samples, plot_range_in_samples) = {_np.arange(-plot_range_in_samples, plot_range_in_samples)}")
+        for blip_number, blip_location in enumerate(detected_blip_locations, 1):
+            # detected_blip_locations = [24000 72000]
+            # _np.arange(-plot_range_in_samples, plot_range_in_samples) = [-24000 ... 23999]
+            # 24000 + -2 - 12000 = 11998
+            # [(-32 + delay) + blip_location : (31 + delay)]
+            # [(-32 + -2 + 24000) : (32 + -2 + 24000)]
+            start_time_in_samples = int(-plot_range_in_samples + latency + blip_location)
+            print(f"start_time_in_samples = {start_time_in_samples}")
+            end_time_in_samples = int(plot_range_in_samples + latency + blip_location)
+            print(f"end_time_in_samples = {end_time_in_samples}")
+            #NOTE: Enable this if you need to debug (e.g., if the blip location doesn't show up in the plot).
+            #print(f"y[start_time_in_samples : end_time_in_samples] for blip {blip_number} = {y[start_time_in_samples : end_time_in_samples]}")
             _plt.plot(
-                _np.arange(-di, di),
-                y[ii - di + latency : ii + di + latency],
-                ".-",
-                label=f"Output {e}",
+                _np.arange(-plot_range_in_samples, plot_range_in_samples),
+                y[start_time_in_samples:end_time_in_samples],
+                linestyle=(0, (2, 2)),
+                alpha=0.9,
+                label=f"Wet {blip_number}"
+            )
+            _plt.plot(
+                _np.arange(-plot_range_in_samples, plot_range_in_samples),
+                x[(start_time_in_samples - latency):(end_time_in_samples - latency)],
+                linestyle=(1, (2, 2)),
+                alpha=0.9,
+                label=f"Dry {blip_number}"
             )
         _plt.axvline(x=0, linestyle="--", color="k")
-        _plt.legend()
+        _plt.ylabel('Amplitude normalized to range [1, -1]')
+        _plt.xlabel(f"Sample range from {-plot_range_in_samples} to {plot_range_in_samples} (relative to first detected blip location)")
+        _plt.legend(fancybox=True, shadow=True)
+        _plt.grid()
         _plt.show()  # This doesn't freeze the notebook
 
 
@@ -940,6 +1000,7 @@ def _check_v5(
         rate = _V5_DATA_INFO.rate
 
         wet_audio_tensor = _wav_to_tensor(output_path, rate=rate)
+        print(f"Wet audio input Tensor length = {len(wet_audio_tensor)}")
         # Minutes:Seconds.Samples
         # (00:00.000 - 00:02.000) = Silence [0:96_000]
         # (00:02.000 - 01:10.000) = Validation 1 [96_000:3_360_000] 1:08 length, 70 * 48000 = 3360000
@@ -961,13 +1022,22 @@ def _check_v5(
         # validation_start=-3_360_000,  # ((9 * 60) + 4.5) * 48000 = 26_136_000 absolute position.
         # noise_interval=(3_372_000, 3_378_000), # silence for 125ms in length, 250ms before the first blip.
         # blip_locations=((3_384_000, 3_432_000),), # Actual locations of each of the two blips.
-        wet_audio_validation_segment_1 = wet_audio_tensor[: _V5_DATA_INFO.t_validate]
-
         dry_audio_tensor_len = len(_wav_to_tensor(input_path))
         print(f"Dry audio input Tensor length = {dry_audio_tensor_len}")
-        wet_audio_validation_segment_2 = wet_audio_tensor[(dry_audio_tensor_len + _V5_DATA_INFO.validation_start) : (dry_audio_tensor_len - (1.5 * rate))]
-        print("First wet audio segment = [96_000:3_360_000]")
-        print(f"Second wet audio segment = [{(dry_audio_tensor_len + _V5_DATA_INFO.validation_start)}:{(dry_audio_tensor_len - (1.5 * rate))}]")
+        # 00:01.500 - 01:10.000
+        wet_audio_validation_segment_1 = wet_audio_tensor[72_000:3_360_000]
+        print('First wet audio segment = 0.5 seconds of silence + 1 minute and 8 seconds of validation #1')
+        # 00:00.500 of silence after 09:04:000
+        # 01:08.000 of validation #2
+        # 00:01.500 of silence til EOF
+        # = total time of 01:10:000 = 3_360_000
+        # 29_472_000 - 3_360_000 = 26_112_000
+        print(f"_V5_DATA_INFO.validation_start = {_V5_DATA_INFO.validation_start}")
+        validation_start_time_in_samples = dry_audio_tensor_len + _V5_DATA_INFO.validation_start
+        validation_stop_time_in_samples = dry_audio_tensor_len - 72_000
+        print(f"Second wet audio segment starts at {validation_start_time_in_samples}")
+        print(f"Second wet audio segment ends at {validation_stop_time_in_samples}")
+        wet_audio_validation_segment_2 = wet_audio_tensor[validation_start_time_in_samples:validation_stop_time_in_samples]
         # Validation (replicate) ESR =
         #   * how much does wet_audio_validation_segment_1 differ from wet_audio_validation_segment_2?
         #   * does either segment drift off-grid from their expected positions relative to the start and end timings of the dry/wet audio files?
@@ -1400,8 +1470,9 @@ def _get_data_config(
             # (01:12.000 - 09:04.000) = Training data (Technically the final sine sweep ends at 09:04.000) [3_456_000:26_112_000]
             # (09:04.000 - 09:04:500) = Silence between sine sweep audio end and Validation 2 audio start
             # (09:04.500 - 10:12.500) = Validation 2 [26_136_000:29_400_000]
-            train_kwargs = {"start_samples": data_info.train_start, "stop_samples": 26_136_000}
-            validation_kwargs = {"start_samples": data_info.validation_start}
+            print(f"train_kwargs start_samples = {data_info.train_start} and stop_samples = {train_stop}")
+            train_kwargs = {"start_samples": data_info.train_start, "stop_samples": train_stop}
+            validation_kwargs = {"start_samples": validation_start}
         else:
             raise NotImplementedError(f"kwargs for input version {input_version}")
         return train_kwargs, validation_kwargs
@@ -1450,7 +1521,6 @@ def _get_configs(
         ny=ny,
         latency=latency,
     )
-
     # MODEL CONFIG
     if model_type == "WaveNet":
         model_config = {
@@ -1460,7 +1530,8 @@ def _get_configs(
                 # "channels" in the first block and "input_size" in the second from 12 to 16.
                 "config": get_wavenet_config(architecture),
             },
-            "loss": {"val_loss": "esr"},
+            "loss": {"val_loss": "esrpreemph"},
+            #"loss": {"val_loss": "esr"},
             "optimizer": {"lr": lr},
             "lr_scheduler": {
                 'class': 'ReduceLROnPlateau',
@@ -1581,7 +1652,7 @@ def _plot(
     _plt.plot(output[window_start:window_end], color='xkcd:orange', linestyle='--', label='Prediction')
     _plt.plot(ds.y[window_start:window_end], color='xkcd:blue', linestyle='solid', label='Target')
     _plt.title(f"ESR={esr:.4g}")
-    _plt.xlabel('Time in samples')
+    _plt.xlabel(f"Time in samples from {window_start} to {window_end}")
     _plt.ylabel('Amplitude normalized to range [1, -1]')
     _plt.legend(fancybox=True, shadow=True)
     _plt.grid()
@@ -1691,6 +1762,9 @@ class _ModelCheckpoint(_pl.callbacks.model_checkpoint.ModelCheckpoint):
         outdir = nam_filepath.parent
         # HACK: Assume the extension
         basename = f"{nam_filepath.name[: -len(self._NAM_FILE_EXTENSION)]}_{int(time.time())}"
+        #print(f"trainer.callback_metrics = {trainer.callback_metrics}")
+        #print(f"trainer.logged_metrics = {trainer.logged_metrics}")
+        logged_metrics = {key: value.item() for key, value in trainer.logged_metrics.items()}
         other_metadata = (
             None
             if not self._include_other_metadata
@@ -1698,7 +1772,9 @@ class _ModelCheckpoint(_pl.callbacks.model_checkpoint.ModelCheckpoint):
                 _metadata.TRAINING_KEY: _metadata.TrainingMetadata(
                     settings=self._settings_metadata,
                     data=self._data_metadata,
-                    validation_esr=None,  # TODO how to get this?
+                    logged_metrics=logged_metrics
+                    #TODO: embed the *final* plotted *full* validation ESR in the checkpoint
+                    #validation_esr=None,
                 ).model_dump()
             }
         )
@@ -1724,9 +1800,10 @@ def get_callbacks(
     data_metadata: _Optional[_metadata.Data] = None,
 ):
     callbacks = [
+        # Save best checkpoint
         _ModelCheckpoint(
             dirpath=dirpath,
-            filename="checkpoint_best_{epoch:04d}_{step}_{ESR:.4g}_{ESRPREEMPH:.4g}_{MSE:.3e}",
+            filename="checkpoint_best_{epoch:04d}_{step}_{ESR:.4g}_{ESRPREEMPH:.4g}_{MSE:.4g}",
             save_top_k=3,
             monitor="val_loss",
             every_n_epochs=1,
@@ -1734,6 +1811,7 @@ def get_callbacks(
             settings_metadata=settings_metadata,
             data_metadata=data_metadata,
         ),
+        # Save last checkpoint
         _ModelCheckpoint(
             dirpath=dirpath,
             filename="checkpoint_last_{epoch:04d}_{step}",
@@ -1742,8 +1820,13 @@ def get_callbacks(
             settings_metadata=settings_metadata,
             data_metadata=data_metadata,
         ),
-        DeviceStatsMonitor(cpu_stats=True),
+        rich_model_summary,
+        # FIXME: Early stopping is too aggressive / stops too early
+        #early_stopping,
+        device_stats_monitor,
+        time_stats_monitor,
     ]
+    # Stop training if stopping threshold ESR validation loss is reached
     if threshold_esr is not None:
         callbacks.append(
             _ValidationStopping(monitor="ESR", stopping_threshold=threshold_esr)
@@ -1988,6 +2071,8 @@ def train(
                 window_end=101_000,  # End of the plotting window, in samples
             )
         elif version.major == 5:
+            # 120 BPM = 2 seconds per bar = 500 ms per 1/4 note = 125 ms per 1/16 note.
+            # 1/4 = 24_000, 1/8 = 12_000, 1/16 = 6_000 samples @ 48_000 Hz sample rate.
             return dict(
                 window_start=96_000,  # Start of the plotting window, in samples
                 window_end=120_000,  # End of the plotting window, in samples
@@ -2033,7 +2118,7 @@ def train(
             metadata=_metadata.TrainingMetadata(
                 settings=settings_metadata,
                 data=data_metadata,
-                validation_esr=validation_esr,
+                logged_metrics={'final_plotted_validation_esr': validation_esr},
             ),
         )
 

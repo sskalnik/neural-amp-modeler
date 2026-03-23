@@ -11,7 +11,7 @@ See LICENSE file for the original NAM license (MIT).
         * https://slammincaptures.bigcartel.com
         * https://ko-fi.com/slammincaptures/shop
         * https://www.thegearpage.net/board/index.php?threads/slammin-tonocracy-tonex-nam-captures.2444935
-* REVxSTD, REVySTD, and REVyHi Architectures invented by [38](https://www.thegearpage.net/board/index.php?threads/probably-the-best-nam-quality-in-the-world-revxstd.2727799/)
+* REVxSTD, REVySTD, and REVyHi Architectures invented by [R Gerthsson aka 38](https://www.thegearpage.net/board/index.php?threads/probably-the-best-nam-quality-in-the-world-revxstd.2727799/)
 * "Super Input" created by François NEURALNET (uploaded here with their explicit written permission).
 * Pre-emphasis A-weighting + low-pass filters (just like AIDA-X), which can produce superior results.
 * Additional pre-emphasis filter options, including ITU-468, which is a more modern standard than A-weighting.

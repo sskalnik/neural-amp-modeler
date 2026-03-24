@@ -139,3 +139,6 @@ nam/train/gui/_resources/settings.json
 
 # Resources downloaded into tests/
 tests/resources/*.reapeaks
+
+# Large audio files
+dry_input_audio_files/**.wav
